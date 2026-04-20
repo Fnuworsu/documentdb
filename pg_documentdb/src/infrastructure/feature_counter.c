@@ -315,6 +315,8 @@ static char FeatureMapping[MAX_FEATURE_COUNT][MAX_FEATURE_NAME_LENGTH] = {
 	[FEATURE_COMMAND_COLLMOD_INDEX_HIDDEN] = "collMod_index_hidden",
 	[FEATURE_COMMAND_COLLMOD_INDEX_PREPARE_UNIQUE] = "collMod_index_prepare_unique",
 	[FEATURE_COMMAND_COLLMOD_UNIQUE] = "collMod_index_unique",
+	[FEATURE_COMMAND_COLLMOD_COLLECTION_PLANNER_STATISTICS] =
+		"collMod_collection_planner_statistics",
 
 	/* Feature Connection Status */
 	[FEATURE_CONNECTION_STATUS] = "connection_status",
@@ -401,6 +403,9 @@ static char FeatureMapping[MAX_FEATURE_COUNT][MAX_FEATURE_NAME_LENGTH] = {
 	[FEATURE_QUERY_OPERATOR_SIZE] = "query_operator_size",
 	[FEATURE_QUERY_OPERATOR_TEXT] = "query_operator_text",
 	[FEATURE_QUERY_OPERATOR_TYPE] = "query_operator_type",
+
+	[FEATURE_QUERY_ORDERED_SAOP_100_TERMS] = "query_ordered_saop_100_terms",
+	[FEATURE_QUERY_ORDERED_SAOP_50_TERMS] = "query_ordered_saop_50_terms",
 
 	/* Feature mapping region - Role CRUD */
 	[FEATURE_ROLE_CREATE] = "role_create",

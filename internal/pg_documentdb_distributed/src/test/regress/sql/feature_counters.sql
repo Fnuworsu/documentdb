@@ -80,6 +80,10 @@ SET documentdb.enableNewWithExprAccumulators TO off;
 -- $group with $count with non-empty arg (tracks group_count_with_arg feature counter)
 SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": "feature_counter_col2", "pipeline": [ { "$group": { "_id": null, "e": { "$count": 1 } } }], "cursor": {} }');
 
+SET documentdb.enableNewWithExprAccumulators TO on;
+SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": "feature_counter_col2", "pipeline": [ { "$group": { "_id": { "$mod": [ { "$toInt": "$_id" }, 2 ] }, "d": { "$sum": "$_id" }, "e": { "$count": 1 } } }], "cursor": {} }');
+SET documentdb.enableNewWithExprAccumulators TO off;
+
 -- $group with first/last
 SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": "feature_counter_col2", "pipeline": [ { "$group": { "_id": { "$mod": [ { "$toInt": "$_id" }, 2 ] }, "d": { "$first": "$_id" }, "e": { "$last":  "$_id" } } }], "cursor": {} }');
 -- $group with firstN/lastN
@@ -292,3 +296,18 @@ SELECT documentdb_distributed_test_helpers.get_feature_counter_pretty(false);
 SELECT * FROM documentdb_api.list_databases('{"listDatabases": 1}') LIMIT 0;
 SELECT documentdb_distributed_test_helpers.get_feature_counter_pretty(true);
 
+-- Test: Feature counter for saop queries that didn't meet the treshold for $in
+SELECT documentdb_api.insert_one('saop_feature', 'counter_value', '{"_id": 1, "a": 1, "b": 10}');
+SELECT documentdb_api.insert_one('saop_feature', 'counter_value', '{"_id": 2, "a": 2, "b": 9}');
+
+-- if documentdb_extended_rum exists, set alternate index handler
+SELECT pg_catalog.set_config('documentdb.alternate_index_handler_name', 'extended_rum', false), extname FROM pg_extension WHERE extname = 'documentdb_extended_rum';
+
+set enable_seqscan to off;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('saop_feature', '{ "createIndexes": "counter_value", "indexes": [ { "key": { "a": 1, "b": 1 }, "name": "a_1_b_1", "storageEngine": { "enableOrderedIndex": true }} ] }', true);
+SELECT document FROM bson_aggregation_pipeline('saop_feature', '{ "aggregate": "counter_value", "pipeline": [ { "$match": { "a": { "$in": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }, "b": { "$in": [10, 9, 8, 7, 6, 5, 4, 3, 2, 1] } } }, {"$sort": { "a": 1 } } ], "cursor": {} }');
+SELECT document FROM bson_aggregation_pipeline('saop_feature', '{ "aggregate": "counter_value", "pipeline": [ { "$match": { "a": { "$in": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }, "b": { "$in": [6, 5, 4, 3, 2, 1] } } }, {"$sort": { "a": 1 } } ], "cursor": {} }');
+
+SELECT documentdb_distributed_test_helpers.get_feature_counter_pretty(true);
+
+SELECT documentdb_api.drop_database('saop_feature');

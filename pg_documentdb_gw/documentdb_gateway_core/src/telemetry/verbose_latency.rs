@@ -10,7 +10,7 @@ use crate::{
     context::ConnectionContext,
     requests::{request_tracker::RequestTracker, Request, RequestIntervalKind},
     responses::CommandError,
-    telemetry::{error_code_to_status_code, event_id::EventId},
+    telemetry::{event_id::EventId, utils},
 };
 
 /// Returns whether verbose latency logging should be emitted for this request.
@@ -62,35 +62,32 @@ pub fn try_log_verbose_latency(
         .map(|r| r.request_type().to_string())
         .unwrap_or_default();
 
-    let (status_code, error_code) = if let Some(err) = error {
-        let code = err.code;
-        (error_code_to_status_code(code.into()), code)
-    } else {
-        (200, 0)
-    };
+    let status_code = utils::get_status_code_u16(error);
+    let error_code = utils::get_error_code_i32(error);
 
     tracing::info!(
         activity_id = activity_id,
         event_id = EventId::RequestTrace.code(),
-        "Latency for Mongo Request with interval timings (ns): ReadRequest={}, HandleMessage={} FormatRequest={}, HandleRequest={}, ProcessRequest={}, PostgresBeginTransaction={}, PostgresSetStatementTimeout={}, PostgresCommitTransaction={}, WriteResponse={}, Address={}, TransportProtocol={}, DatabaseName={}, CollectionName={}, OperationName={}, StatusCode={}, SubStatusCode={}, ErrorCode={}, RequestLength={}, ResponseLength={}",
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::ReadRequest),
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleMessage),
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::FormatRequest),
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest),
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::ProcessRequest),
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction),
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresSetStatementTimeout),
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::WriteResponse),
-        connection_context.ip_address,
-        connection_context.transport_protocol(),
-        database_name,
-        collection,
-        request_type,
-        status_code,
-        0, // SubStatusCode is not used currently in Rust
-        error_code,
-        request_length,
-        response_length
+        read_request = request_tracker.get_interval_elapsed_time(RequestIntervalKind::ReadRequest),
+        handle_message = request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleMessage),
+        format_request = request_tracker.get_interval_elapsed_time(RequestIntervalKind::FormatRequest),
+        handle_request = request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest),
+        process_request = request_tracker.get_interval_elapsed_time(RequestIntervalKind::ProcessRequest),
+        postgres_begin_transaction = request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction),
+        postgres_set_statement_timeout = request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresSetStatementTimeout),
+        postgres_commit_transaction = request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
+        open_backend_connection = request_tracker.get_interval_elapsed_time(RequestIntervalKind::OpenBackendConnection),
+        write_response = request_tracker.get_interval_elapsed_time(RequestIntervalKind::WriteResponse),
+        address = %connection_context.ip_address,
+        transport_protocol = %connection_context.transport_protocol(),
+        database_name = database_name,
+        collection_name = collection,
+        operation_name = request_type,
+        status_code = status_code,
+        sub_status_code = 0,
+        error_code = error_code,
+        request_length = request_length,
+        response_length = response_length,
+        "Latency for Mongo Request with interval timings (ns)."
     );
 }

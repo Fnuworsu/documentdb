@@ -6,16 +6,19 @@
  *-------------------------------------------------------------------------
  */
 
-use std::{str::from_utf8, sync::Arc};
+use std::{
+    str::from_utf8,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use base64::{engine::general_purpose, Engine as _};
 use bson::{rawdoc, spec::BinarySubtype};
 use rand::Rng;
 use serde_json::Value;
-use tokio::{
-    sync::RwLock,
-    time::{sleep, Duration},
-};
+use tokio::time::{sleep, Duration};
 use tokio_postgres::{error::SqlState, types::Type};
 
 use crate::{
@@ -25,7 +28,7 @@ use crate::{
     processor,
     protocol::OK_SUCCEEDED,
     requests::{Request, RequestType},
-    responses::{self, RawResponse, Response},
+    responses::{self, constant::generic_internal_error_message, RawResponse, Response},
 };
 
 const NONCE_LENGTH: usize = 2;
@@ -52,12 +55,12 @@ pub struct ScramFirstState {
 
 #[derive(Debug)]
 pub struct AuthState {
-    authorized: Arc<RwLock<bool>>,
+    authorized: Arc<AtomicBool>,
     first_state: Option<ScramFirstState>,
     username: Option<String>,
     user_oid: Option<u32>,
     auth_kind: Option<AuthKind>,
-    timer_initialized: Arc<RwLock<bool>>,
+    timer_initialized: Arc<AtomicBool>,
     auth_mechanism: AuthMechanism,
 }
 
@@ -71,12 +74,12 @@ impl AuthState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            authorized: Arc::new(RwLock::new(false)),
+            authorized: Arc::new(AtomicBool::new(false)),
             first_state: None,
             username: None,
             user_oid: None,
             auth_kind: None,
-            timer_initialized: Arc::new(RwLock::new(false)),
+            timer_initialized: Arc::new(AtomicBool::new(false)),
             auth_mechanism: AuthMechanism::Unknown,
         }
     }
@@ -106,8 +109,12 @@ impl AuthState {
     }
 
     #[must_use]
-    pub fn is_authorized(&self) -> Arc<RwLock<bool>> {
-        Arc::clone(&self.authorized)
+    pub fn is_authorized(&self) -> bool {
+        self.authorized.load(Ordering::Acquire)
+    }
+
+    pub fn set_authorized(&self, value: bool) {
+        self.authorized.store(value, Ordering::Release);
     }
 
     #[must_use]
@@ -150,13 +157,13 @@ impl AuthState {
         self.auth_mechanism = mechanism;
     }
 
-    async fn initialize_expiry_timer(
+    fn initialize_expiry_timer(
         &self,
         timeout_secs: u64,
         connection_activity_id: &str,
     ) -> Result<()> {
         let timer_initialized = Arc::clone(&self.timer_initialized);
-        if *timer_initialized.read().await {
+        if timer_initialized.load(Ordering::Acquire) {
             return Err(DocumentDBError::internal_error(
                 "Authentication expiry timer is already initialized".to_owned(),
             ));
@@ -167,7 +174,7 @@ impl AuthState {
 
         // Spawn new expiry task that counts down and sets authorized to false
         tokio::spawn(async move {
-            *timer_initialized.write().await = true;
+            timer_initialized.store(true, Ordering::Release);
 
             sleep(Duration::from_secs(timeout_secs)).await;
 
@@ -176,8 +183,8 @@ impl AuthState {
                 activity_id = connection_activity_id_as_str,
                 "Authentication expiry timer elapsed"
             );
-            *authorized.write().await = false;
-            *timer_initialized.write().await = false;
+            authorized.store(false, Ordering::Release);
+            timer_initialized.store(false, Ordering::Release);
         });
 
         Ok(())
@@ -335,19 +342,16 @@ async fn handle_oidc(
     handle_oidc_token_authentication(connection_context, jwt_token).await
 }
 
-async fn handle_oidc_token_authentication(
-    connection_context: &mut ConnectionContext,
+async fn perform_oidc_authentication(
+    connection_context: &ConnectionContext,
+    oid: &str,
     token_string: &str,
-) -> Result<Response> {
-    let (oid, seconds_until_expiry) = parse_and_validate_jwt_token(token_string)?;
-
-    let connection = connection_context
+) -> Result<()> {
+    match connection_context
         .service_context
         .connection_pool_manager()
         .authentication_connection()
-        .await?;
-
-    let authentication_token_row = match connection
+        .await?
         .query(
             connection_context
                 .service_context
@@ -358,14 +362,29 @@ async fn handle_oidc_token_authentication(
         )
         .await
     {
-        Ok(rows) => rows,
+        Ok(rows) => {
+            let auth_result: String = rows
+                .first()
+                .ok_or(DocumentDBError::pg_response_empty())?
+                .try_get(0)?;
+
+            if auth_result.trim() != oid {
+                return Err(DocumentDBError::authentication_failed(
+                    "Token validation failed".to_owned(),
+                ));
+            }
+
+            Ok(())
+        }
         Err(e) => {
             if let Some(db_error) = e.as_db_error() {
                 tracing::error!(
                     activity_id = connection_context.connection_id.to_string().as_str(),
-                    "Backend error during authentication: PostgresError({:?}, {:?})",
-                    db_error.code(),
-                    db_error.hint()
+                    error = %db_error,
+                    sub_status = %db_error.code().code(),
+                    error_file_name = %db_error.file().unwrap_or("not_found"),
+                    error_file_line_num = %db_error.line().unwrap_or_default(),
+                    "DbError during authentication: error = {{error}}, sub_status = {{sub_status}}, file = {{error_file_name}}, line = {{error_file_line_num}}."
                 );
 
                 if let Some(extension_error_code) =
@@ -386,31 +405,40 @@ async fn handle_oidc_token_authentication(
                         "External identity is not present in the system.".to_owned(),
                     )),
                     // All other errors are returned as InternalError in authentication code path.
-                    _ => Err(DocumentDBError::authentication_failed(
-                        "Internal Error.".to_owned(),
+                    _ => Err(DocumentDBError::authentication_failed_with_custom_log(
+                        generic_internal_error_message().to_owned(),
+                        &format!(
+                            "DbError during authentication: {}, code: {}, file: {}, line: {}.",
+                            db_error,
+                            db_error.code().code(),
+                            db_error.file().unwrap_or("not_found"),
+                            db_error.line().unwrap_or_default()
+                        ),
                     )),
                 };
             }
+
             tracing::error!(
                 activity_id = connection_context.connection_id.to_string().as_str(),
-                "DbError not found in PostgresError, which is unexpected."
+                error = %e,
+                "Non DbError from backend during authentication. error = {{error}}"
             );
-            return Err(DocumentDBError::authentication_failed(
-                "Internal Error.".to_owned(),
-            ));
+
+            Err(DocumentDBError::authentication_failed_with_custom_log(
+                generic_internal_error_message().to_owned(),
+                &format!("Non DbError from backend during authentication. error = {e}"),
+            ))
         }
-    };
-
-    let authentication_result: String = authentication_token_row
-        .first()
-        .ok_or(DocumentDBError::pg_response_empty())?
-        .try_get(0)?;
-
-    if authentication_result.trim() != oid {
-        return Err(DocumentDBError::authentication_failed(
-            "Token validation failed".to_owned(),
-        ));
     }
+}
+
+async fn handle_oidc_token_authentication(
+    connection_context: &mut ConnectionContext,
+    token_string: &str,
+) -> Result<Response> {
+    let (oid, seconds_until_expiry) = parse_and_validate_jwt_token(token_string)?;
+
+    perform_oidc_authentication(connection_context, &oid, token_string).await?;
 
     let server_signature = "";
     let payload = bson::Binary {
@@ -421,7 +449,7 @@ async fn handle_oidc_token_authentication(
     connection_context.auth_state.set_username(&oid);
     connection_context.auth_state.user_oid = Some(get_user_oid(connection_context, &oid).await?);
 
-    *connection_context.auth_state.is_authorized().write().await = true;
+    connection_context.auth_state.set_authorized(true);
     connection_context
         .auth_state
         .set_auth_kind(AuthKind::ExternalIdentity)?;
@@ -441,8 +469,7 @@ async fn handle_oidc_token_authentication(
     );
     connection_context
         .auth_state
-        .initialize_expiry_timer(seconds_until_expiry, connection_activity_id_as_str)
-        .await?;
+        .initialize_expiry_timer(seconds_until_expiry, connection_activity_id_as_str)?;
 
     Ok(Response::Raw(RawResponse(rawdoc! {
         "payload": payload,
@@ -620,7 +647,7 @@ async fn handle_sasl_continue(
         connection_context.auth_state.user_oid =
             Some(get_user_oid(connection_context, username).await?);
 
-        *connection_context.auth_state.is_authorized().write().await = true;
+        connection_context.auth_state.set_authorized(true);
         connection_context.allocate_data_pool("")?;
 
         connection_context

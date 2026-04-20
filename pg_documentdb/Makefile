@@ -28,6 +28,7 @@ API_SCHEMA_NAME=documentdb_api
 API_SCHEMA_NAME_V2=documentdb_api
 CORE_SCHEMA_NAME=documentdb_core
 POSTGIS_SCHEMA_NAME=public
+ENABLE_RBAC_SCHEMA=1
 
 # Built-in roles
 API_ADMIN_ROLE=documentdb_admin_role
@@ -78,6 +79,12 @@ check-documentdb-minimal: check-minimal
 
 check-extended-rum-minimal:
 	$(MAKE) -C src/test/extended_rum_tests check-minimal
+
+check-isolation:
+	$(MAKE) -C src/test/regress check-isolation
+
+check-isolation-minimal:
+	$(MAKE) -C src/test/regress check-isolation-minimal
 
 check-valgrind:
 	mkdir -p $(CURDIR)/src/test/regress/log/

@@ -202,6 +202,7 @@ typedef struct IndexElemmatchState
 
 extern bool EnableExtendedExplainPlans;
 extern bool EnableExplainScanIndexCosts;
+extern bool EnableOrderByIndexTerm;
 
 /* --------------------------------------------------------- */
 /* Forward declaration */
@@ -278,8 +279,6 @@ static bool MatchIndexPathForIndexHint(IndexPath *path, void *matchContext);
 static bool TryUseAlternateIndexForIndexHint(PlannerInfo *root, RelOptInfo *rel,
 											 ReplaceExtensionFunctionContext *context,
 											 MatchIndexPath matchIndexPath);
-static bool EnableIndexHintForceIndexPushdown(PlannerInfo *root,
-											  ReplaceExtensionFunctionContext *context);
 static void ThrowIndexHintUnableToFindIndex(void);
 
 static List * UpdateIndexListForPrimaryKeyLookup(List *existingIndex,
@@ -332,7 +331,7 @@ static const ForceIndexSupportFuncs ForceIndexOperatorSupport[] =
 		.matchIndexPath = &MatchIndexPathForIndexHint,
 		.alternatePath = &TryUseAlternateIndexForIndexHint,
 		.noIndexHandler = &ThrowIndexHintUnableToFindIndex,
-		.enableForceIndexPushdown = &EnableIndexHintForceIndexPushdown
+		.enableForceIndexPushdown = &DefaultTrueForceIndexPushdown
 	},
 	[ForceIndexOpType_PrimaryKeyLookup] = {
 		.operator = ForceIndexOpType_PrimaryKeyLookup,
@@ -411,7 +410,7 @@ dollar_support(PG_FUNCTION_ARGS)
 	else if (IsA(supportRequest, SupportRequestSelectivity))
 	{
 		SupportRequestSelectivity *req = (SupportRequestSelectivity *) supportRequest;
-		if (EnableCompositeIndexPlanner)
+		if (EnablePlannerCostSelectivity(req->root, req->args))
 		{
 			const MongoIndexOperatorInfo *indexOperator =
 				GetMongoIndexOperatorInfoByPostgresFuncId(req->funcid);
@@ -779,8 +778,7 @@ CheckRestrictionPathNodeForIndexOperation(Expr *currentExpr,
 	if (IsA(currentExpr, FuncExpr))
 	{
 		FuncExpr *funcExpr = (FuncExpr *) currentExpr;
-		if (IsClusterVersionAtleast(DocDB_V0, 106, 0) &&
-			funcExpr->funcid == BsonIndexHintFunctionOid())
+		if (funcExpr->funcid == BsonIndexHintFunctionOid())
 		{
 			Node *secondNode = lsecond(funcExpr->args);
 			if (!IsA(secondNode, Const))
@@ -1566,15 +1564,9 @@ CheckOpArgIsValidForIndexOnlyScan(Const *arg, bytea *indexOptions, BsonIndexStra
 
 	Datum queryValue = arg->constvalue;
 	pgbsonelement queryElement;
-	const char *collation = PgbsonToSinglePgbsonElementWithCollation(DatumGetPgBson(
-																		 queryValue),
-																	 &queryElement);
-
-	if (IsCollationValid(collation))
-	{
-		/* index with collation is not yet supported. */
-		return false;
-	}
+	const char *queryCollation = PgbsonToSinglePgbsonElementWithCollation(DatumGetPgBson(
+																			  queryValue),
+																		  &queryElement);
 
 	if (indexStrategy == BSON_INDEX_STRATEGY_DOLLAR_IN)
 	{
@@ -1594,7 +1586,7 @@ CheckOpArgIsValidForIndexOnlyScan(Const *arg, bytea *indexOptions, BsonIndexStra
 		return false;
 	}
 
-	return ValidateIndexForQualifierElement(indexOptions, &queryElement,
+	return ValidateIndexForQualifierElement(indexOptions, &queryElement, queryCollation,
 											indexStrategy);
 }
 
@@ -2176,9 +2168,51 @@ GetSortDetails(PlannerInfo *root, Index rti,
 
 			*hasOrderBy = true;
 		}
+		else if (EnableOrderByIndexTerm &&
+				 (func->funcid == BsonOrderByIndexFunctionOid() ||
+				  func->funcid == BsonOrderByIndexReverseFunctionOid()))
+		{
+			/* TODO: Collation index pushdown support. */
+			if (*hasGroupby)
+			{
+				return NIL;
+			}
+
+			*hasOrderBy = true;
+		}
 		else if (func->funcid == BsonExpressionGetFunctionOid() ||
 				 func->funcid == BsonExpressionGetWithLetFunctionOid())
 		{
+			if (*hasOrderBy)
+			{
+				return NIL;
+			}
+
+			*hasGroupby = true;
+		}
+		else if (func->funcid == DocumentDBCoreBsonToBsonFunctionOId())
+		{
+			Expr *firstArg = linitial(func->args);
+			if (!IsA(firstArg, FuncExpr))
+			{
+				return NIL;
+			}
+
+			FuncExpr *firstArgFunc = (FuncExpr *) firstArg;
+			if (firstArgFunc->funcid == BsonExpressionGetWithLetFunctionOid())
+			{
+				func = firstArgFunc;
+			}
+			else
+			{
+				return NIL;
+			}
+
+			/* This is a special function that we allow for group by pushdown - it is used for the case
+			 * where we have a group by with an expression that can be rewritten to a path and we want
+			 * to be able to push down the path extraction to the index. We only allow this for group by
+			 * because for order by we want to be more strict and only allow direct paths.
+			 */
 			if (*hasOrderBy)
 			{
 				return NIL;
@@ -2195,6 +2229,16 @@ GetSortDetails(PlannerInfo *root, Index rti,
 		Expr *firstArg = linitial(func->args);
 		Expr *secondArg = lsecond(func->args);
 
+		if (IsA(firstArg, RelabelType))
+		{
+			firstArg = ((RelabelType *) firstArg)->arg;
+		}
+
+		if (IsA(secondArg, RelabelType))
+		{
+			secondArg = ((RelabelType *) secondArg)->arg;
+		}
+
 		if (!IsA(firstArg, Var) || !IsA(secondArg, Const))
 		{
 			return NIL;
@@ -2205,8 +2249,11 @@ GetSortDetails(PlannerInfo *root, Index rti,
 
 		if (firstVar->varno != (int) rti ||
 			firstVar->varattno != DOCUMENT_DATA_TABLE_DOCUMENT_VAR_ATTR_NUMBER ||
-			firstVar->vartype != BsonTypeId() ||
-			secondConst->consttype != BsonTypeId() || secondConst->constisnull)
+			(firstVar->vartype != BsonTypeId() && firstVar->vartype !=
+			 DocumentDBCoreBsonTypeId()) ||
+			(secondConst->consttype != BsonTypeId() && secondConst->consttype !=
+			 DocumentDBCoreBsonTypeId()) ||
+			secondConst->constisnull)
 		{
 			return NIL;
 		}
@@ -2219,30 +2266,46 @@ GetSortDetails(PlannerInfo *root, Index rti,
 			/* In the case of group by the expression would be { "": expr }
 			 * Here we can push down to the index iff the expression is a path.
 			 */
-			if (sortElement.bsonValue.value_type != BSON_TYPE_UTF8)
+			const char *groupFieldPath = NULL;
+			uint32_t groupFieldPathLen = 0;
+
+			if (sortElement.bsonValue.value_type == BSON_TYPE_UTF8)
+			{
+				if (sortElement.bsonValue.value.v_utf8.len > 1 &&
+					sortElement.bsonValue.value.v_utf8.str[0] == '$' &&
+					sortElement.bsonValue.value.v_utf8.str[1] != '$')
+				{
+					groupFieldPath = sortElement.bsonValue.value.v_utf8.str + 1;
+					groupFieldPathLen = sortElement.bsonValue.value.v_utf8.len - 1;
+				}
+			}
+			else if (sortElement.bsonValue.value_type == BSON_TYPE_DOCUMENT)
+			{
+				pgbsonelement docElement;
+				if (TryGetSingleFieldPathFromBsonValue(&sortElement.bsonValue,
+													   &docElement))
+				{
+					groupFieldPath = docElement.bsonValue.value.v_utf8.str + 1;
+					groupFieldPathLen = docElement.bsonValue.value.v_utf8.len - 1;
+				}
+			}
+
+			if (groupFieldPath == NULL)
 			{
 				return NIL;
 			}
 
-			if (sortElement.bsonValue.value.v_utf8.len > 1 &&
-				sortElement.bsonValue.value.v_utf8.str[0] == '$')
-			{
-				/* This is a valid path: Track the path in the sortElement to decide pushdown */
-				sortElement.path = sortElement.bsonValue.value.v_utf8.str + 1;
-				sortElement.pathLength = sortElement.bsonValue.value.v_utf8.len - 1;
-				sortElement.bsonValue.value_type = BSON_TYPE_INT32;
-				sortElement.bsonValue.value.v_int32 = SortPathKeyStrategy(pathkey) ==
-													  BTGreaterStrategyNumber ? -1 : 1;
-				pgbson *sortSpec = PgbsonElementToPgbson(&sortElement);
+			/* This is a valid path: Track the path in the sortElement to decide pushdown */
+			sortElement.path = groupFieldPath;
+			sortElement.pathLength = groupFieldPathLen;
+			sortElement.bsonValue.value_type = BSON_TYPE_INT32;
+			sortElement.bsonValue.value.v_int32 = SortPathKeyStrategy(pathkey) ==
+												  BTGreaterStrategyNumber ? -1 : 1;
+			pgbson *sortSpec = PgbsonElementToPgbson(&sortElement);
 
-				/* Also rewrite the secondConst so that the Expr on the sort operator is correct */
-				secondConst = makeConst(BsonTypeId(), -1, InvalidOid, -1, PointerGetDatum(
-											sortSpec), false, false);
-			}
-			else
-			{
-				return NIL;
-			}
+			/* Also rewrite the secondConst so that the Expr on the sort operator is correct */
+			secondConst = makeConst(BsonTypeId(), -1, InvalidOid, -1, PointerGetDatum(
+										sortSpec), false, false);
 		}
 
 		SortIndexInputDetails *sortDetailsInput =
@@ -2251,6 +2314,7 @@ GetSortDetails(PlannerInfo *root, Index rti,
 		sortDetailsInput->sortPathKey = pathkey;
 		sortDetailsInput->sortVar = (Expr *) firstVar;
 		sortDetailsInput->sortDatum = (Expr *) secondConst;
+		sortDetailsInput->funcOid = func->funcid;
 		sortDetails = lappend(sortDetails, sortDetailsInput);
 
 		*isOrderById = *isOrderById ||
@@ -2500,13 +2564,6 @@ ProcessOrderByStatements(PlannerInfo *root,
 				break;
 			}
 
-			if (determinedSortOrder < 0 &&
-				!(IsClusterVersionAtleast(DocDB_V0, 107, 0) ||
-				  IsClusterVersionAtLeastPatch(DocDB_V0, 106, 1)))
-			{
-				break;
-			}
-
 			SortIndexInputDetails *sortDetailsInput =
 				(SortIndexInputDetails *) list_nth(sortDetails, sortDetailsIndex);
 
@@ -2520,14 +2577,46 @@ ProcessOrderByStatements(PlannerInfo *root,
 
 			/* Path sort order matches the currently determined index sort order */
 			/* Now we've reached the first orderby */
-			Oid indexOperator = pathSortOrders[i] < 0 ?
-								BsonOrderByReverseIndexOperatorId() :
-								BsonOrderByIndexOperatorId();
-			Expr *orderElement = make_opclause(
-				indexOperator, BsonTypeId(), false,
-				(Expr *) sortDetailsInput->sortVar,
-				(Expr *) sortDetailsInput->sortDatum,
-				InvalidOid, InvalidOid);
+			OpExpr *orderElement;
+			if (sortDetailsInput->funcOid == BsonOrderByIndexFunctionOid() ||
+				sortDetailsInput->funcOid == BsonOrderByIndexReverseFunctionOid())
+			{
+				Oid indexOperator = BsonOrderByBsonIndexTypeOperatorId();
+
+				/* sortDatum in the index order case we push is the index sort datum */
+				pgbsonelement sortElement;
+				sortElement.path = sortDetailsInput->sortPath;
+				sortElement.pathLength = strlen(sortDetailsInput->sortPath);
+				sortElement.bsonValue.value_type = BSON_TYPE_INT32;
+				sortElement.bsonValue.value.v_int32 =
+					SortPathKeyStrategy(sortDetailsInput->sortPathKey) ==
+					BTGreaterStrategyNumber ?
+					-1 : 1;
+				pgbson *sortDatum = PgbsonElementToPgbson(&sortElement);
+				Const *sortConst = makeConst(BsonTypeId(), -1, InvalidOid, -1,
+											 PointerGetDatum(sortDatum),
+											 false, false);
+
+				orderElement = (OpExpr *) make_opclause(
+					indexOperator, BsonIndexTermTypeId(), false,
+					(Expr *) sortDetailsInput->sortVar,
+					(Expr *) sortConst,
+					InvalidOid, InvalidOid);
+				orderElement->opfuncid = get_opcode(indexOperator);
+			}
+			else
+			{
+				Oid indexOperator = pathSortOrders[i] < 0 ?
+									BsonOrderByReverseIndexOperatorId() :
+									BsonOrderByIndexOperatorId();
+				orderElement = (OpExpr *) make_opclause(
+					indexOperator, BsonTypeId(), false,
+					(Expr *) sortDetailsInput->sortVar,
+					(Expr *) sortDetailsInput->sortDatum,
+					InvalidOid, InvalidOid);
+				orderElement->opfuncid = get_opcode(indexOperator);
+			}
+
 			indexOrderBys = lappend(indexOrderBys, orderElement);
 			indexPathKeys = lappend(indexPathKeys, sortDetailsInput->sortPathKey);
 			indexOrderbyCols = lappend_int(indexOrderbyCols, 0);
@@ -4817,14 +4906,6 @@ ThrowIndexHintUnableToFindIndex(void)
 	ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_UNABLETOFINDINDEX),
 					errmsg(
 						"index specified by index hint is not found or invalid for the filters")));
-}
-
-
-static bool
-EnableIndexHintForceIndexPushdown(PlannerInfo *root,
-								  ReplaceExtensionFunctionContext *context)
-{
-	return IsClusterVersionAtleast(DocDB_V0, 106, 0);
 }
 
 

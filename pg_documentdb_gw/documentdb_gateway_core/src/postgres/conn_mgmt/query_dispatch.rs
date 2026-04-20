@@ -15,7 +15,7 @@ use tokio::time::{Duration, Instant};
 use tokio_postgres::error::SqlState;
 
 use crate::{
-    error::{DocumentDBError, ErrorCode, Result},
+    error::{DocumentDBError, ErrorCode, ErrorKind, Result},
     postgres::conn_mgmt::{
         connection::{Connection, QueryOptions, RequestOptions},
         retry_policies::{LongRetryPolicy, RetryPolicyBuilder, ShortRetryPolicy},
@@ -184,12 +184,12 @@ fn retry_policy(
 ///
 /// Works for both pool-related errors and direct postgres errors
 const fn extract_pg_error(error: &DocumentDBError) -> Option<&tokio_postgres::Error> {
-    match error {
-        DocumentDBError::PoolError(
+    match error.kind() {
+        ErrorKind::PoolError(
             PoolError::Backend(e) | PoolError::PostCreateHook(HookError::Backend(e)),
             _,
         )
-        | DocumentDBError::PostgresError(e, _) => Some(e),
+        | ErrorKind::PostgresError(e, _) => Some(e),
         _ => None,
     }
 }
@@ -320,11 +320,16 @@ where
                 // SET statement_timeout will be issued, so the connection state
                 // is reset on return and won't leak the setting to other requests.
                 ConnectionSource::Pool(pool) => {
+                    let open_backend_connection_start = Instant::now();
                     let acquire = if needs_timeout_pool {
                         pool.acquire_timeout_connection().await
                     } else {
                         pool.acquire_connection().await
                     };
+                    request_tracker.record_duration(
+                        RequestIntervalKind::OpenBackendConnection,
+                        open_backend_connection_start,
+                    );
 
                     match acquire {
                         Ok(pool_conn) => Arc::new(Connection::new(pool_conn, false)),
@@ -335,10 +340,10 @@ where
                                 );
                             }
 
-                            break 'attempt Err(DocumentDBError::PoolError(
+                            break 'attempt Err(DocumentDBError::new(ErrorKind::PoolError(
                                 e,
                                 Backtrace::capture(),
-                            ));
+                            )));
                         }
                     }
                 }
@@ -360,7 +365,10 @@ where
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        break 'attempt Err(DocumentDBError::PostgresError(e, Backtrace::capture()))
+                        break 'attempt Err(DocumentDBError::new(ErrorKind::PostgresError(
+                            e,
+                            Backtrace::capture(),
+                        )))
                     }
                 }
             } else {
@@ -390,14 +398,20 @@ where
                                 // PostgreSQL auto-rolls-back a failed COMMIT, so the
                                 // connection is no longer in a transaction.
                                 connection.set_in_transaction(false);
-                                Err(DocumentDBError::PostgresError(e, Backtrace::capture()))
+                                Err(DocumentDBError::new(ErrorKind::PostgresError(
+                                    e,
+                                    Backtrace::capture(),
+                                )))
                             }
                         }
                     }
                     Err(e) => {
                         let _ = connection.batch_execute("ROLLBACK").await;
                         connection.set_in_transaction(false);
-                        Err(DocumentDBError::PostgresError(e, Backtrace::capture()))
+                        Err(DocumentDBError::new(ErrorKind::PostgresError(
+                            e,
+                            Backtrace::capture(),
+                        )))
                     }
                 }
             } else {
@@ -405,7 +419,9 @@ where
                 // closure call, avoiding an Arc::clone + drop pair.
                 let query_result = run_func(connection).await;
                 request_tracker.record_duration(RequestIntervalKind::ProcessRequest, request_start);
-                query_result.map_err(|e| DocumentDBError::PostgresError(e, Backtrace::capture()))
+                query_result.map_err(|e| {
+                    DocumentDBError::new(ErrorKind::PostgresError(e, Backtrace::capture()))
+                })
             }
         };
 

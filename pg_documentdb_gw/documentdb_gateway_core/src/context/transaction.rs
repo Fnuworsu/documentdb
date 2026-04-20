@@ -6,7 +6,9 @@
  *-------------------------------------------------------------------------
  */
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
+use std::fmt;
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use tokio::{
@@ -17,14 +19,54 @@ use tokio_postgres::IsolationLevel;
 
 use crate::{
     configuration::DynamicConfiguration,
-    context::{ConnectionContext, CursorStore},
+    context::{ConnectionContext, CursorStore, SessionId},
     error::{DocumentDBError, ErrorCode, Result},
     postgres::{self, conn_mgmt::Connection, PgDataClient},
 };
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TransactionNumber(i64);
+
+impl TransactionNumber {
+    #[must_use]
+    pub const fn new(transaction_number: i64) -> Self {
+        Self(transaction_number)
+    }
+}
+
+impl From<i64> for TransactionNumber {
+    fn from(value: i64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&i64> for TransactionNumber {
+    fn from(value: &i64) -> Self {
+        Self(*value)
+    }
+}
+
+impl From<TransactionNumber> for i64 {
+    fn from(transaction_number: TransactionNumber) -> Self {
+        transaction_number.0
+    }
+}
+
+impl fmt::Display for TransactionNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Debug for TransactionNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TransactionNumber({self})")
+    }
+}
+
 #[derive(Debug)]
 pub struct RequestTransactionInfo {
-    pub transaction_number: i64,
+    pub transaction_number: TransactionNumber,
     pub auto_commit: bool,
     pub start_transaction: bool,
     pub is_request_within_transaction: bool,
@@ -33,8 +75,8 @@ pub struct RequestTransactionInfo {
 
 #[derive(Debug)]
 pub struct GatewayTransaction {
-    pub session_id: Vec<u8>,
-    pub transaction_number: i64,
+    pub session_id: SessionId,
+    pub transaction_number: TransactionNumber,
     username: String,
     auth_db: String,
     pub cursors: CursorStore,
@@ -50,7 +92,7 @@ impl GatewayTransaction {
         request: &RequestTransactionInfo,
         conn: Arc<Connection>,
         isolation_level: IsolationLevel,
-        session_id: Vec<u8>,
+        session_id: SessionId,
         username: String,
         auth_db: String,
     ) -> Result<Self> {
@@ -72,7 +114,7 @@ impl GatewayTransaction {
     }
 
     #[must_use]
-    pub fn get_session_id(&self) -> &[u8] {
+    pub const fn get_session_id(&self) -> &SessionId {
         &self.session_id
     }
 
@@ -109,7 +151,7 @@ impl GatewayTransaction {
     }
 
     #[must_use]
-    pub const fn transaction_number(&self) -> i64 {
+    pub const fn transaction_number(&self) -> TransactionNumber {
         self.transaction_number
     }
 
@@ -151,12 +193,12 @@ enum TransactionState {
 
 #[derive(Debug)]
 struct LastSeenTransaction {
-    transaction_number: i64,
+    transaction_number: TransactionNumber,
     state: TransactionState,
 }
 
 impl LastSeenTransaction {
-    pub const fn new(transaction_number: i64) -> Self {
+    pub const fn new(transaction_number: TransactionNumber) -> Self {
         Self {
             transaction_number,
             state: TransactionState::Started,
@@ -168,8 +210,8 @@ type TransactionEntry = (Instant, GatewayTransaction);
 
 #[derive(Debug)]
 pub struct TransactionStore {
-    pub transactions: Arc<DashMap<Vec<u8>, TransactionEntry>>,
-    last_seen_transactions: DashMap<Vec<u8>, LastSeenTransaction>,
+    pub transactions: Arc<DashMap<SessionId, TransactionEntry>>,
+    last_seen_transactions: DashMap<SessionId, LastSeenTransaction>,
     _reaper: JoinHandle<()>,
 }
 
@@ -191,7 +233,7 @@ impl TransactionStore {
     }
 
     #[must_use]
-    pub fn get_connection(&self, session_id: &[u8]) -> Option<Arc<Connection>> {
+    pub fn get_connection(&self, session_id: &SessionId) -> Option<Arc<Connection>> {
         self.transactions
             .get(session_id)
             .and_then(|entry| entry.value().1.get_connection())
@@ -205,7 +247,7 @@ impl TransactionStore {
         &self,
         connection_context: &ConnectionContext,
         transaction_info: &RequestTransactionInfo,
-        session_id: Vec<u8>,
+        session_id: SessionId,
         pg_data_client: &impl PgDataClient,
     ) -> Result<()> {
         if let Some((_, transaction_number)) = connection_context.transaction.as_ref() {
@@ -331,8 +373,8 @@ impl TransactionStore {
     /// last-seen record is missing, or if aborting the transaction fails.
     pub async fn remove_transaction_by_session(
         &self,
-        session_id: &[u8],
-    ) -> Result<Option<(Vec<u8>, TransactionEntry)>> {
+        session_id: &SessionId,
+    ) -> Result<Option<(SessionId, TransactionEntry)>> {
         let Some((deleted_sessions_id, mut transaction_entry)) =
             self.transactions.remove(session_id)
         else {
@@ -359,7 +401,7 @@ impl TransactionStore {
     /// # Errors
     ///
     /// Returns an error if aborting any removed transaction fails.
-    pub async fn remove_all_transactions(&self) -> Result<Vec<(Vec<u8>, TransactionEntry)>> {
+    pub async fn remove_all_transactions(&self) -> Result<Vec<(SessionId, TransactionEntry)>> {
         let session_ids = self
             .transactions
             .iter()
@@ -377,7 +419,7 @@ impl TransactionStore {
     pub async fn remove_transactions_by_users(
         &self,
         users: &HashSet<(String, String)>,
-    ) -> Result<Vec<(Vec<u8>, TransactionEntry)>> {
+    ) -> Result<Vec<(SessionId, TransactionEntry)>> {
         let session_ids = self
             .transactions
             .iter()
@@ -393,8 +435,8 @@ impl TransactionStore {
 
     async fn remove_transactions_by_session_ids(
         &self,
-        session_ids: &[Vec<u8>],
-    ) -> Result<Vec<(Vec<u8>, TransactionEntry)>> {
+        session_ids: &[SessionId],
+    ) -> Result<Vec<(SessionId, TransactionEntry)>> {
         let mut removed_transactions = Vec::new();
 
         for session_id in session_ids {
@@ -415,7 +457,7 @@ impl TransactionStore {
     /// # Errors
     ///
     /// Returns an error if the operation fails.
-    pub async fn abort(&self, session_id: &[u8]) -> Result<()> {
+    pub async fn abort(&self, session_id: &SessionId) -> Result<()> {
         self.remove_transaction_by_session(session_id)
             .await?
             .map(|_| ())
@@ -432,7 +474,7 @@ impl TransactionStore {
     /// # Errors
     ///
     /// Returns an error if the operation fails.
-    pub async fn commit(&self, session_id: &[u8]) -> Result<()> {
+    pub async fn commit(&self, session_id: &SessionId) -> Result<()> {
         if let Some((_, (_, mut transaction))) = self.transactions.remove(session_id) {
             transaction.commit().await?;
             if let Some(mut last_seen) = self.last_seen_transactions.get_mut(session_id) {

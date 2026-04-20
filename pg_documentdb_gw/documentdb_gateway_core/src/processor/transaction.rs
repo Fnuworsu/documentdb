@@ -8,14 +8,13 @@
 
 use crate::{
     context::{ConnectionContext, RequestContext},
-    error::{DocumentDBError, ErrorCode, Result},
+    error::{DocumentDBError, ErrorCode, ErrorKind, Result},
     postgres::PgDataClient,
     requests::RequestType,
     responses::Response,
 };
 
 // Create the transaction if required, and populate the context information with the transaction info
-#[expect(clippy::expect_used, reason = "session must exist during transaction")]
 pub async fn handle(
     request_context: &RequestContext<'_>,
     connection_context: &mut ConnectionContext,
@@ -32,8 +31,11 @@ pub async fn handle(
 
         let session_id = request_info
             .session_id
-            .expect("Given that there's a transaction, there must be a session")
-            .to_vec();
+            .clone()
+            .ok_or(DocumentDBError::internal_error(
+                "Session Id is missing. Transactions must be associated with a session.".to_owned(),
+            ))?;
+
         let store = connection_context.service_context.transaction_store();
         let transaction_result = store
             .create(
@@ -47,10 +49,14 @@ pub async fn handle(
         if let Err(e) = transaction_result {
             return match (request.request_type(), &e) {
                 // Especially allow the transaction to remain unfilled if it is committing a committed transaction
-                (
-                    RequestType::CommitTransaction,
-                    DocumentDBError::DocumentDBError(ErrorCode::TransactionCommitted, _, _, _),
-                ) => Ok(()),
+                (RequestType::CommitTransaction, error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::DocumentDBError(ErrorCode::TransactionCommitted, _, _, _)
+                    ) =>
+                {
+                    Ok(())
+                }
                 _ => Err(e),
             };
         }

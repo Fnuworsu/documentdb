@@ -1,562 +1,614 @@
-SET documentdb.next_collection_id TO 8000;
-SET documentdb.next_collection_index_id TO 8000;
+SET documentdb.next_collection_id TO 8100;
+SET documentdb.next_collection_index_id TO 8100;
 
 SET documentdb_core.enableCollation TO on;
-SET documentdb.enableCollationWithIndexes TO on;
-SET documentdb.defaultUseCompositeOpClass TO off;
+SET documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SET documentdb.defaultUseCompositeOpClass TO on;
 
 SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog;
 
-CREATE SCHEMA collation_index_test_schema;
+-- ===== Section 0: Negative tests ======
 
-CREATE FUNCTION collation_index_test_schema.gin_bson_index_term_to_bson(bytea) 
-RETURNS bson
-LANGUAGE c
-AS '$libdir/pg_documentdb', 'gin_bson_index_term_to_bson';
+-- ordered/composite index with collation should fail when
+-- enableCollationWithNonUniqueOrderedIndexes is OFF
+SET documentdb.enableCollationWithNonUniqueOrderedIndexes TO off;
 
--- ===== Single-path indexes ======
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_collated",
+    "createIndexes": "ord_guc_off_fail",
     "indexes": [{
-      "key": { "name": 1 },
-      "name": "name_collated_idx",
+      "key": { "a": 1 },
+      "name": "a_coll_guc_off_idx",
       "collation": { "locale": "en", "strength": 1 }
     }]
   }',
   TRUE
 );
 
-SELECT (index_spec).index_name,
-       documentdb_core.bson_get_value_text((index_spec).index_options, 'collation') AS collation
-FROM documentdb_api_catalog.collection_indexes
-WHERE collection_id = (SELECT collection_id FROM documentdb_api_catalog.collections 
-                       WHERE database_name = 'coll_idx_db' AND collection_name = 'coll_collated')
-ORDER BY index_id;
+SET documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
 
--- Check the index structure after insertions
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_collated', '{"_id": 1, "name": "Apple"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_collated', '{"_id": 2, "name": "apple"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_collated', '{"_id": 3, "name": "APPLE"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_collated', '{"_id": 4, "name": "Banana"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_collated', '{"_id": 5, "name": "banana"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_collated', '{"_id": 6, "name": "cherry"}', NULL);
-
-\d documentdb_data.documents_8001
-
--- Strength=1: 6 docs produce 4 index entries (Apple/apple/APPLE collapsed, Banana/banana collapsed)
-SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
-FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8002', 1), 
-    'documentdb_data.documents_rum_index_8002'::regclass
-) entry;
-
--- TODO: Query with matching collation should use the index
--- It will not use the index yet until we have supported index pushdown.
-BEGIN;
-SET LOCAL enable_seqscan TO OFF;
-SELECT document FROM bson_aggregation_find('coll_idx_db', '{ "find": "coll_collated", "filter": { "name": { "$eq": "apple" } }, "collation": { "locale": "en", "strength": 1 } }');
-EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('coll_idx_db', '{ "find": "coll_collated", "filter": { "name": { "$eq": "apple" } }, "collation": { "locale": "en", "strength": 1 } }');
-ROLLBACK;
-
-
--- numericOrdering: true 
+-- unique ordered index with collation should fail
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_numeric_true",
+    "createIndexes": "ord_unique_fail",
     "indexes": [{
-      "key": { "item": 1 },
-      "name": "item_numorder_true_idx",
+      "key": { "a": 1, "b": 1 },
+      "name": "a_b_unique_coll_idx",
+      "unique": true,
       "collation": { "locale": "en", "numericOrdering": true }
     }]
   }',
   TRUE
 );
 
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_true', '{"_id": 1, "item": "item1"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_true', '{"_id": 2, "item": "item10"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_true', '{"_id": 3, "item": "item2"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_true', '{"_id": 4, "item": "item20"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_true', '{"_id": 5, "item": "item3"}', NULL);
+-- non-ordered index with collation should fail
+SET documentdb.defaultUseCompositeOpClass TO off;
 
-\d documentdb_data.documents_8002
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_non_ordered_fail",
+    "indexes": [{
+      "key": { "a": 1 },
+      "name": "a_non_ordered_coll_idx",
+      "collation": { "locale": "en", "strength": 1 }
+    }]
+  }',
+  TRUE
+);
+
+SET documentdb.defaultUseCompositeOpClass TO on;
+
+-- hashed index with collation should fail
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_hashed_fail",
+    "indexes": [{
+      "key": { "a": "hashed" },
+      "name": "a_hashed_coll_idx",
+      "collation": { "locale": "en", "strength": 1 }
+    }]
+  }',
+  TRUE
+);
+
+-- 2d index with collation should fail
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_2d_fail",
+    "indexes": [{
+      "key": { "loc": "2d" },
+      "name": "loc_2d_coll_idx",
+      "collation": { "locale": "en", "strength": 1 }
+    }]
+  }',
+  TRUE
+);
+
+-- text index with collation should fail
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_text_fail",
+    "indexes": [{
+      "key": { "content": "text" },
+      "name": "content_text_coll_idx",
+      "collation": { "locale": "en", "strength": 1 }
+    }]
+  }',
+  TRUE
+);
+
+-- 2dsphere index with collation should fail
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_2dsphere_fail",
+    "indexes": [{
+      "key": { "loc": "2dsphere" },
+      "name": "loc_2dsphere_coll_idx",
+      "collation": { "locale": "en", "strength": 1 }
+    }]
+  }',
+  TRUE
+);
+
+CREATE SCHEMA IF NOT EXISTS collation_ordered_test_schema;
+
+CREATE FUNCTION collation_ordered_test_schema.gin_bson_index_term_to_bson(bytea) 
+RETURNS bson
+LANGUAGE c
+AS '$libdir/pg_documentdb', 'gin_bson_index_term_to_bson';
+
+
+-- ===== Section 1: Single-key ordered index with numericOrdering=true ======
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_numord_true",
+    "indexes": [{
+      "key": { "item": 1 },
+      "name": "item_numord_true_idx",
+      "collation": { "locale": "en", "numericOrdering": true }
+    }]
+  }',
+  TRUE
+);
+
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_true', '{"_id": 1, "item": "item1"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_true', '{"_id": 2, "item": "item10"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_true', '{"_id": 3, "item": "item2"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_true', '{"_id": 4, "item": "item20"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_true', '{"_id": 5, "item": "item3"}', NULL);
+
+\d documentdb_data.documents_8101
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_numord_true"}');
 
 -- numericOrdering=true: sorted numerically as item1 < item2 < item3 < item10 < item20
 SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
 FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8004', 1), 
-    'documentdb_data.documents_rum_index_8004'::regclass
+    public.get_raw_page('documentdb_data.documents_rum_index_8102', 1), 
+    'documentdb_data.documents_rum_index_8102'::regclass
 ) entry;
 
--- numericOrdering: false 
+
+-- ===== Section 2: Single-key ordered index with numericOrdering=false ======
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_numeric_false",
+    "createIndexes": "ord_numord_false",
     "indexes": [{
       "key": { "item": 1 },
-      "name": "item_numorder_false_idx",
+      "name": "item_numord_false_idx",
       "collation": { "locale": "en", "numericOrdering": false }
     }]
   }',
   TRUE
 );
 
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_false', '{"_id": 1, "item": "item1"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_false', '{"_id": 2, "item": "item10"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_false', '{"_id": 3, "item": "item2"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_false', '{"_id": 4, "item": "item20"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_numeric_false', '{"_id": 5, "item": "item3"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_false', '{"_id": 1, "item": "item1"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_false', '{"_id": 2, "item": "item10"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_false', '{"_id": 3, "item": "item2"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_false', '{"_id": 4, "item": "item20"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_numord_false', '{"_id": 5, "item": "item3"}', NULL);
 
-\d documentdb_data.documents_8003
+\d documentdb_data.documents_8102
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_numord_false"}');
 
 -- numericOrdering=false: sorted lexically as item1 < item10 < item2 < item20 < item3
 SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
 FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8006', 1), 
-    'documentdb_data.documents_rum_index_8006'::regclass
+    public.get_raw_page('documentdb_data.documents_rum_index_8104', 1), 
+    'documentdb_data.documents_rum_index_8104'::regclass
 ) entry;
 
--- ===== Single-path index with arrays and nested objects ======
 
+-- ===== Section 3: Compound ordered index with numericOrdering=true ======
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_nested",
+    "createIndexes": "ord_compound_numord_true",
     "indexes": [{
-      "key": { "tags": 1 },
-      "name": "tags_collated_idx",
-      "collation": { "locale": "en", "strength": 1 }
+      "key": { "item": 1, "qty": 1 },
+      "name": "item_qty_numord_true_idx",
+      "collation": { "locale": "en", "numericOrdering": true }
     }]
   }',
   TRUE
 );
 
--- Insert documents with arrays containing strings
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested', '{"_id": 1, "tags": ["Apple", "Banana"]}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested', '{"_id": 2, "tags": ["apple", "cherry"]}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested', '{"_id": 3, "tags": ["APPLE", "BANANA", "zebra"]}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested', '{"_id": 4, "tags": "single_tag"}', NULL);
--- Nested object with string value at indexed path
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested', '{"_id": 5, "tags": {"nested": "value"}}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_true', '{"_id": 1, "item": "item1", "qty": 10}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_true', '{"_id": 2, "item": "item10", "qty": 20}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_true', '{"_id": 3, "item": "item2", "qty": 30}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_true', '{"_id": 4, "item": "item20", "qty": 40}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_true', '{"_id": 5, "item": "item3", "qty": 50}', NULL);
 
-\d documentdb_data.documents_8004
+\d documentdb_data.documents_8103
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_compound_numord_true"}');
 
--- Strength=1 arrays: 10 entries - case variants (Apple/apple/APPLE) share one sort key
+-- numericOrdering=true compound: item sorted numerically, qty is number so unaffected
 SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
 FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8008', 1), 
-    'documentdb_data.documents_rum_index_8008'::regclass
+    public.get_raw_page('documentdb_data.documents_rum_index_8106', 1), 
+    'documentdb_data.documents_rum_index_8106'::regclass
 ) entry;
 
--- ===== Single-path index with arrays/nested objects: strength=3 (case-sensitive) ======
 
+-- ===== Section 4: Compound ordered index with numericOrdering=false ======
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_nested_s3",
+    "createIndexes": "ord_compound_numord_false",
     "indexes": [{
-      "key": { "tags": 1 },
-      "name": "tags_collated_s3_idx",
-      "collation": { "locale": "en", "strength": 3 }
+      "key": { "item": 1, "qty": 1 },
+      "name": "item_qty_numord_false_idx",
+      "collation": { "locale": "en", "numericOrdering": false }
     }]
   }',
   TRUE
 );
 
--- Insert same documents as strength=1 test for comparison
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested_s3', '{"_id": 1, "tags": ["Apple", "Banana"]}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested_s3', '{"_id": 2, "tags": ["apple", "cherry"]}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested_s3', '{"_id": 3, "tags": ["APPLE", "BANANA", "zebra"]}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested_s3', '{"_id": 4, "tags": "single_tag"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_nested_s3', '{"_id": 5, "tags": {"nested": "value"}}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_false', '{"_id": 1, "item": "item1", "qty": 10}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_false', '{"_id": 2, "item": "item10", "qty": 20}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_false', '{"_id": 3, "item": "item2", "qty": 30}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_false', '{"_id": 4, "item": "item20", "qty": 40}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_numord_false', '{"_id": 5, "item": "item3", "qty": 50}', NULL);
 
-\d documentdb_data.documents_8005
+\d documentdb_data.documents_8104
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_compound_numord_false"}');
 
--- Strength=3 arrays: 13 entries - case variants (apple, Apple, APPLE) each get separate sort keys
+-- numericOrdering=false compound: item sorted lexically
 SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
 FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8010', 1), 
-    'documentdb_data.documents_rum_index_8010'::regclass
+    public.get_raw_page('documentdb_data.documents_rum_index_8108', 1), 
+    'documentdb_data.documents_rum_index_8108'::regclass
 ) entry;
 
--- ===== Wildcard index with collation ======
+
+-- ===== Section 5: Single-key ordered index with strength=1 ======
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_wildcard_coll",
-    "indexes": [{
-      "key": { "$**": 1 },
-      "name": "wildcard_collated_idx",
-      "collation": { "locale": "en", "strength": 2 }
-    }]
-  }',
-  TRUE
-);
-
-SELECT (index_spec).index_name,
-       documentdb_core.bson_get_value_text((index_spec).index_options, 'collation') AS collation
-FROM documentdb_api_catalog.collection_indexes
-WHERE collection_id = (SELECT collection_id FROM documentdb_api_catalog.collections 
-                       WHERE database_name = 'coll_idx_db' AND collection_name = 'coll_wildcard_coll')
-ORDER BY index_id;
-
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_wildcard_coll', '{"_id": 1, "name": "Zebra", "city": "Austin"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_wildcard_coll', '{"_id": 2, "name": "apple", "city": "Boston"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_wildcard_coll', '{"_id": 3, "name": "Apple", "city": "Chicago"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_wildcard_coll', '{"_id": 4, "name": "banana", "city": "Denver"}', NULL);
-
-\d documentdb_data.documents_8006
-
--- Strength=2 wildcard: indexes all fields; name sorted as apple < banana < Zebra
-SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
-FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8012', 1), 
-    'documentdb_data.documents_rum_index_8012'::regclass
-) entry;
-
--- ===== Wildcard projection index ======
-
-SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
-  '{
-    "createIndexes": "coll_wp_coll",
-    "indexes": [{
-      "key": { "$**": 1 },
-      "name": "wp_collated_idx",
-      "wildcardProjection": { "title": 1 },
-      "collation": { "locale": "en", "strength": 1 }
-    }]
-  }',
-  TRUE
-);
-
-SELECT (index_spec).index_name,
-       documentdb_core.bson_get_value_text((index_spec).index_options, 'collation') AS collation
-FROM documentdb_api_catalog.collection_indexes
-WHERE collection_id = (SELECT collection_id FROM documentdb_api_catalog.collections 
-                       WHERE database_name = 'coll_idx_db' AND collection_name = 'coll_wp_coll')
-ORDER BY index_id;
-
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_wp_coll', '{"_id": 1, "title": "Zebra", "other": "not_indexed"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_wp_coll', '{"_id": 2, "title": "apple", "other": "not_indexed"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_wp_coll', '{"_id": 3, "title": "APPLE", "other": "not_indexed"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_wp_coll', '{"_id": 4, "title": "banana", "other": "not_indexed"}', NULL);
-
-\d documentdb_data.documents_8007
-
--- Strength=1 wildcard projection: only "title" field indexed; apple/APPLE collapsed
-SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
-FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8014', 1), 
-    'documentdb_data.documents_rum_index_8014'::regclass
-) entry;
-
--- ===== Truncated long strings with collation ======
-SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
-  '{
-    "createIndexes": "coll_truncated",
-    "indexes": [{
-      "key": { "longfield": 1 },
-      "name": "longfield_collated_idx",
-      "collation": { "locale": "en", "strength": 1 }
-    }]
-  }',
-  TRUE
-);
-
--- Insert documents with very long strings that will be truncated
--- Different prefixes to test ordering: "aaa..." vs "bbb..." vs "zzz..."
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated', 
-  bson_build_document('_id'::text, 1, 'longfield'::text, ('aaa' || repeat('x', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated', 
-  bson_build_document('_id'::text, 2, 'longfield'::text, ('AAA' || repeat('x', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated', 
-  bson_build_document('_id'::text, 3, 'longfield'::text, ('bbb' || repeat('y', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated', 
-  bson_build_document('_id'::text, 4, 'longfield'::text, ('BBB' || repeat('y', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated', 
-  bson_build_document('_id'::text, 5, 'longfield'::text, ('zzz' || repeat('z', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated', 
-  bson_build_document('_id'::text, 6, 'longfield'::text, ('ZZZ' || repeat('z', 3000))::text), NULL);
-
-\d documentdb_data.documents_8008
-
--- Strength=1 truncated: 5 entries for 6 docs - aaa.../AAA... and bbb.../BBB... collapsed; $flags=1 indicates truncation
-SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
-FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8016', 1), 
-    'documentdb_data.documents_rum_index_8016'::regclass
-) entry;
-
--- ===== Truncated strings with strength=3 (case-sensitive) ======
-
-SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
-  '{
-    "createIndexes": "coll_truncated_s3",
-    "indexes": [{
-      "key": { "longfield": 1 },
-      "name": "longfield_collated_s3_idx",
-      "collation": { "locale": "en", "strength": 3 }
-    }]
-  }',
-  TRUE
-);
-
--- Same long strings with case-sensitive collation
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated_s3', 
-  bson_build_document('_id'::text, 1, 'longfield'::text, ('aaa' || repeat('x', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated_s3', 
-  bson_build_document('_id'::text, 2, 'longfield'::text, ('AAA' || repeat('x', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated_s3', 
-  bson_build_document('_id'::text, 3, 'longfield'::text, ('bbb' || repeat('y', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated_s3', 
-  bson_build_document('_id'::text, 4, 'longfield'::text, ('BBB' || repeat('y', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated_s3', 
-  bson_build_document('_id'::text, 5, 'longfield'::text, ('zzz' || repeat('z', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_truncated_s3', 
-  bson_build_document('_id'::text, 6, 'longfield'::text, ('ZZZ' || repeat('z', 3000))::text), NULL);
-
-\d documentdb_data.documents_8009
-
--- Strength=3 truncated: 8 entries for 6 docs - aaa.../AAA..., bbb.../BBB..., zzz.../ZZZ... each distinct; $flags=1 indicates truncation
-SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
-FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8018', 1), 
-    'documentdb_data.documents_rum_index_8018'::regclass
-) entry;
-
--- ===== Mix of truncated and non-truncated strings ======
-
-SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
-  '{
-    "createIndexes": "coll_mixed_length",
-    "indexes": [{
-      "key": { "data": 1 },
-      "name": "data_collated_idx",
-      "collation": { "locale": "en", "strength": 1 }
-    }]
-  }',
-  TRUE
-);
-
--- Short strings (no truncation)
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_mixed_length', '{"_id": 1, "data": "Apple"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_mixed_length', '{"_id": 2, "data": "apple"}', NULL);
--- Medium strings with same prefix as truncated ones
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_mixed_length', 
-  bson_build_document('_id'::text, 3, 'data'::text, ('apple' || repeat('z', 50))::text), NULL);
--- Long truncated strings
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_mixed_length', 
-  bson_build_document('_id'::text, 4, 'data'::text, ('apple' || repeat('z', 3000))::text), NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_mixed_length', 
-  bson_build_document('_id'::text, 5, 'data'::text, ('APPLE' || repeat('z', 3000))::text), NULL);
--- Another short string that should sort after apple
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_mixed_length', '{"_id": 6, "data": "banana"}', NULL);
-
-\d documentdb_data.documents_8010
-
--- Strength=1 mixed lengths: short "Apple"/"apple" collapsed; truncated entries have $flags=1
-SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
-FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8020', 1), 
-    'documentdb_data.documents_rum_index_8020'::regclass
-) entry;
-
--- ===== Documents inserted BEFORE index creation (index build) ======
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_test', '{"_id": 1, "name": "Apple"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_test', '{"_id": 2, "name": "apple"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_test', '{"_id": 3, "name": "APPLE"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_test', '{"_id": 4, "name": "Banana"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_test', '{"_id": 5, "name": "banana"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_test', '{"_id": 6, "name": "cherry"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_test', '{"_id": 7, "name": "Cherry"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_test', '{"_id": 8, "name": "CHERRY"}', NULL);
-
--- Now create the collation-aware index on existing documents
-SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
-  '{
-    "createIndexes": "coll_build_test",
+    "createIndexes": "ord_single_s1",
     "indexes": [{
       "key": { "name": 1 },
-      "name": "name_build_collated_idx",
+      "name": "name_s1_idx",
       "collation": { "locale": "en", "strength": 1 }
     }]
   }',
   TRUE
 );
 
-\d documentdb_data.documents_8011
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_single_s1', '{"_id": 1, "name": "Apple"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_single_s1', '{"_id": 2, "name": "apple"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_single_s1', '{"_id": 3, "name": "APPLE"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_single_s1', '{"_id": 4, "name": "Banana"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_single_s1', '{"_id": 5, "name": "banana"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_single_s1', '{"_id": 6, "name": "cherry"}', NULL);
 
--- Strength=1 index build: 8 docs produce 5 entries - Apple/apple/APPLE, Banana/banana, cherry/Cherry/CHERRY collapsed
+\d documentdb_data.documents_8105
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_single_s1"}');
+
+-- Strength=1: Apple/apple/APPLE collapse to the same collation sort key
 SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
 FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8022', 1), 
-    'documentdb_data.documents_rum_index_8022'::regclass
+    public.get_raw_page('documentdb_data.documents_rum_index_8110', 1), 
+    'documentdb_data.documents_rum_index_8110'::regclass
 ) entry;
 
--- ===== Index build with strength=3 (case-sensitive) ======
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_s3', '{"_id": 1, "name": "Apple"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_s3', '{"_id": 2, "name": "apple"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_s3', '{"_id": 3, "name": "APPLE"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_s3', '{"_id": 4, "name": "Banana"}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_build_s3', '{"_id": 5, "name": "banana"}', NULL);
 
+-- ===== Section 6: Compound ordered index with strength=1 and numericOrdering=true ======
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_build_s3",
+    "createIndexes": "ord_compound_s1_numord",
     "indexes": [{
-      "key": { "name": 1 },
-      "name": "name_build_s3_idx",
+      "key": { "name": 1, "age": 1 },
+      "name": "name_age_s1_numord_idx",
+      "collation": { "locale": "en", "strength": 1, "numericOrdering": true }
+    }]
+  }',
+  TRUE
+);
+
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s1_numord', '{"_id": 1, "name": "Apple", "age": 30}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s1_numord', '{"_id": 2, "name": "apple", "age": 25}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s1_numord', '{"_id": 3, "name": "APPLE", "age": 35}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s1_numord', '{"_id": 4, "name": "Banana", "age": 20}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s1_numord', '{"_id": 5, "name": "banana", "age": 40}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s1_numord', '{"_id": 6, "name": "cherry", "age": 15}', NULL);
+
+\d documentdb_data.documents_8106
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_compound_s1_numord"}');
+
+-- Compound strength=1 + numericOrdering: case-insensitive name, numeric age
+SELECT entry->>'offset' AS offset,
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+FROM documentdb_api_internal.documentdb_rum_page_get_entries(
+    public.get_raw_page('documentdb_data.documents_rum_index_8112', 1), 
+    'documentdb_data.documents_rum_index_8112'::regclass
+) entry;
+
+
+-- ===== Section 7: Compound ordered index with strength=3 ======
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_compound_s3",
+    "indexes": [{
+      "key": { "name": 1, "age": 1 },
+      "name": "name_age_s3_idx",
       "collation": { "locale": "en", "strength": 3 }
     }]
   }',
   TRUE
 );
 
-\d documentdb_data.documents_8012
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s3', '{"_id": 1, "name": "Apple", "age": 30}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s3', '{"_id": 2, "name": "apple", "age": 25}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s3', '{"_id": 3, "name": "APPLE", "age": 35}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s3', '{"_id": 4, "name": "Banana", "age": 20}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_s3', '{"_id": 5, "name": "banana", "age": 40}', NULL);
 
--- Strength=3 index build: 5 docs produce 7 entries - apple, Apple, APPLE, Banana, banana each distinct
+\d documentdb_data.documents_8107
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_compound_s3"}');
+
+-- Compound strength=3: case variants produce distinct composite terms
 SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
 FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8024', 1), 
-    'documentdb_data.documents_rum_index_8024'::regclass
+    public.get_raw_page('documentdb_data.documents_rum_index_8114', 1), 
+    'documentdb_data.documents_rum_index_8114'::regclass
 ) entry;
 
--- ===== Partial filter expression with wildcard on details.$** ======
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial', '{"_id": 1, "name": "Apple", "status": "Active", "details": {"items": ["apple", "banana", "cherry"], "info": {"city": "austin", "country": "usa"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial', '{"_id": 2, "name": "apple", "status": "INACTIVE", "details": {"items": ["APPLE", "BANANA", "CHERRY"], "info": {"city": "AUSTIN", "country": "USA"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial', '{"_id": 3, "name": "APPLE", "status": "ACTIVE", "details": {"items": ["Apple", "Banana", "Cherry"], "info": {"city": "Austin", "country": "Usa"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial', '{"_id": 4, "name": "Banana", "status": "active", "details": {"items": ["aPPLE", "bANANA", "cHERRY"], "info": {"city": "aUSTIN", "country": "uSA"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial', '{"_id": 5, "name": "banana", "status": "Inactive", "details": {"items": ["APPle", "BANana", "CHErry"], "info": {"city": "AUSTin", "country": "UsA"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial', '{"_id": 6, "name": "cherry", "status": "aCTIVE", "details": {"items": ["applE", "bananA", "cherrY"], "info": {"city": "austiN", "country": "usA"}}}', NULL);
 
--- Create single-path index on name and wildcard index on details.$**
+-- ===== Section 8: Arrays in single-key ordered index with numericOrdering=true ======
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_partial",
-    "indexes": [
-      {
-        "key": { "name": 1 },
-        "name": "name_partial_s1_idx",
-        "collation": { "locale": "en", "strength": 1 },
-        "partialFilterExpression": { "status": "active" }
-      },
-      {
-        "key": { "details.$**": 1 },
-        "name": "details_wildcard_s1_idx",
-        "collation": { "locale": "en", "strength": 1 },
-        "partialFilterExpression": { "status": "active" }
-      }
-    ]
+    "createIndexes": "ord_array_numord",
+    "indexes": [{
+      "key": { "codes": 1 },
+      "name": "codes_numord_true_idx",
+      "collation": { "locale": "en", "numericOrdering": true }
+    }]
   }',
   TRUE
 );
 
-\d documentdb_data.documents_8013
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_array_numord', '{"_id": 1, "codes": ["code1", "code10"]}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_array_numord', '{"_id": 2, "codes": ["code2", "code20"]}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_array_numord', '{"_id": 3, "codes": ["code3"]}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_array_numord', '{"_id": 4, "codes": "code100"}', NULL);
 
--- Show index info
-SELECT (index_spec).index_name,
-       documentdb_core.bson_get_value_text((index_spec).index_options, 'collation') AS collation
-FROM documentdb_api_catalog.collection_indexes
-WHERE collection_id = (SELECT collection_id FROM documentdb_api_catalog.collections 
-                       WHERE database_name = 'coll_idx_db' AND collection_name = 'coll_partial')
-ORDER BY index_id;
+\d documentdb_data.documents_8108
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_array_numord"}');
 
--- Strength=1 partial: only 4 entries (Apple, Banana, cherry) for docs where status="active" (case-insensitive match)
+-- Array with numericOrdering=true: code1 < code2 < code3 < code10 < code20 < code100
 SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
 FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8026', 1), 
-    'documentdb_data.documents_rum_index_8026'::regclass
+    public.get_raw_page('documentdb_data.documents_rum_index_8116', 1), 
+    'documentdb_data.documents_rum_index_8116'::regclass
 ) entry;
 
--- Strength=1 wildcard partial: nested details.$** indexed for docs where status="active"
-SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
-FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8027', 1), 
-    'documentdb_data.documents_rum_index_8027'::regclass
-) entry;
 
--- ===== Partial filter expression with strength=3 (case-sensitive) ======
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial_s3', '{"_id": 1, "name": "Apple", "status": "Active", "details": {"items": ["apple", "banana", "cherry"], "info": {"city": "austin", "country": "usa"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial_s3', '{"_id": 2, "name": "apple", "status": "INACTIVE", "details": {"items": ["APPLE", "BANANA", "CHERRY"], "info": {"city": "AUSTIN", "country": "USA"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial_s3', '{"_id": 3, "name": "APPLE", "status": "ACTIVE", "details": {"items": ["Apple", "Banana", "Cherry"], "info": {"city": "Austin", "country": "Usa"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial_s3', '{"_id": 4, "name": "Banana", "status": "active", "details": {"items": ["aPPLE", "bANANA", "cHERRY"], "info": {"city": "aUSTIN", "country": "uSA"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial_s3', '{"_id": 5, "name": "banana", "status": "Inactive", "details": {"items": ["APPle", "BANana", "CHErry"], "info": {"city": "AUSTin", "country": "UsA"}}}', NULL);
-SELECT documentdb_api.insert_one('coll_idx_db', 'coll_partial_s3', '{"_id": 6, "name": "cherry", "status": "aCTIVE", "details": {"items": ["applE", "bananA", "cherrY"], "info": {"city": "austiN", "country": "usA"}}}', NULL);
-
+-- ===== Section 9: Arrays in compound ordered index with numericOrdering=false ======
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
-  'coll_idx_db',
+  'ord_coll_ordered_db',
   '{
-    "createIndexes": "coll_partial_s3",
-    "indexes": [
-      {
-        "key": { "name": 1 },
-        "name": "name_partial_s3_idx",
-        "collation": { "locale": "en", "strength": 3 },
-        "partialFilterExpression": { "status": "active" }
-      },
-      {
-        "key": { "details.$**": 1 },
-        "name": "details_wildcard_s3_idx",
-        "collation": { "locale": "en", "strength": 3 },
-        "partialFilterExpression": { "status": "active" }
-      }
-    ]
+    "createIndexes": "ord_compound_array",
+    "indexes": [{
+      "key": { "codes": 1, "priority": 1 },
+      "name": "codes_priority_numord_false_idx",
+      "collation": { "locale": "en", "numericOrdering": false }
+    }]
   }',
   TRUE
 );
 
-\d documentdb_data.documents_8014
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_array', '{"_id": 1, "codes": ["code1", "code10"], "priority": 1}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_array', '{"_id": 2, "codes": ["code2", "code20"], "priority": 2}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_compound_array', '{"_id": 3, "codes": "code3", "priority": 3}', NULL);
 
--- Show index info
-SELECT (index_spec).index_name,
-       documentdb_core.bson_get_value_text((index_spec).index_options, 'collation') AS collation
-FROM documentdb_api_catalog.collection_indexes
-WHERE collection_id = (SELECT collection_id FROM documentdb_api_catalog.collections 
-                       WHERE database_name = 'coll_idx_db' AND collection_name = 'coll_partial_s3')
-ORDER BY index_id;
+\d documentdb_data.documents_8109
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_compound_array"}');
 
--- Strength=3 partial: only 2 entries (Banana) - only doc with exact status="active" indexed
+-- Array compound numericOrdering=false: codes sorted lexically (code1 < code10 < code2 < code20 < code3)
 SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
 FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8029', 1), 
-    'documentdb_data.documents_rum_index_8029'::regclass
-) entry;
-
--- Strength=3 wildcard partial: nested details.$** indexed only for doc with exact status="active"
-SELECT entry->>'offset' AS offset,
-       collation_index_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
-FROM documentdb_api_internal.documentdb_rum_page_get_entries(
-    public.get_raw_page('documentdb_data.documents_rum_index_8030', 1), 
-    'documentdb_data.documents_rum_index_8030'::regclass
+    public.get_raw_page('documentdb_data.documents_rum_index_8118', 1), 
+    'documentdb_data.documents_rum_index_8118'::regclass
 ) entry;
 
 
-DROP SCHEMA collation_index_test_schema CASCADE;
+-- ===== Section 10: Index build — documents before index creation, numericOrdering=true ======
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_build_numord', '{"_id": 1, "item": "item1", "tag": "A"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_build_numord', '{"_id": 2, "item": "item10", "tag": "B"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_build_numord', '{"_id": 3, "item": "item2", "tag": "C"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_build_numord', '{"_id": 4, "item": "item20", "tag": "D"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_build_numord', '{"_id": 5, "item": "item3", "tag": "E"}', NULL);
 
-RESET documentdb.enableCollationWithIndexes;
+-- Create the collated ordered index on existing documents
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_build_numord",
+    "indexes": [{
+      "key": { "item": 1, "tag": 1 },
+      "name": "item_tag_build_numord_idx",
+      "collation": { "locale": "en", "numericOrdering": true }
+    }]
+  }',
+  TRUE
+);
+
+\d documentdb_data.documents_8110
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_build_numord"}');
+
+-- Index build numericOrdering=true: item sorted numerically (item1 < item2 < item3 < item10 < item20)
+SELECT entry->>'offset' AS offset,
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+FROM documentdb_api_internal.documentdb_rum_page_get_entries(
+    public.get_raw_page('documentdb_data.documents_rum_index_8120', 1), 
+    'documentdb_data.documents_rum_index_8120'::regclass
+) entry;
+
+
+-- ===== Section 11: Missing fields and nulls with numericOrdering=true ======
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_missing",
+    "indexes": [{
+      "key": { "x": 1, "y": 1 },
+      "name": "x_y_numord_true_idx",
+      "collation": { "locale": "en", "numericOrdering": true }
+    }]
+  }',
+  TRUE
+);
+
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_missing', '{"_id": 1, "x": "item1", "y": "val1"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_missing', '{"_id": 2, "x": "item10"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_missing', '{"_id": 3, "y": "val2"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_missing', '{"_id": 4}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_missing', '{"_id": 5, "x": null, "y": "val3"}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_missing', '{"_id": 6, "x": 42, "y": "val4"}', NULL);
+
+\d documentdb_data.documents_8111
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_missing"}');
+
+-- Missing/null: collation only applies to string values; missing and null use standard ordering
+SELECT entry->>'offset' AS offset,
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+FROM documentdb_api_internal.documentdb_rum_page_get_entries(
+    public.get_raw_page('documentdb_data.documents_rum_index_8122', 1), 
+    'documentdb_data.documents_rum_index_8122'::regclass
+) entry;
+
+
+-- ===== Section 12: Multiple collations on same collection (numericOrdering true vs false) ======
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_multi_coll",
+    "indexes": [{
+      "key": { "item": 1, "value": 1 },
+      "name": "item_val_numord_true_idx",
+      "collation": { "locale": "en", "numericOrdering": true }
+    }]
+  }',
+  TRUE
+);
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_multi_coll",
+    "indexes": [{
+      "key": { "item": 1, "value": 1 },
+      "name": "item_val_numord_false_idx",
+      "collation": { "locale": "en", "numericOrdering": false }
+    }]
+  }',
+  TRUE
+);
+
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_multi_coll', '{"_id": 1, "item": "item1", "value": 100}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_multi_coll', '{"_id": 2, "item": "item10", "value": 200}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_multi_coll', '{"_id": 3, "item": "item2", "value": 300}', NULL);
+
+\d documentdb_data.documents_8112
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_multi_coll"}');
+
+-- numericOrdering=true index: item1 < item2 < item10
+SELECT entry->>'offset' AS offset,
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+FROM documentdb_api_internal.documentdb_rum_page_get_entries(
+    public.get_raw_page('documentdb_data.documents_rum_index_8124', 1), 
+    'documentdb_data.documents_rum_index_8124'::regclass
+) entry;
+
+-- numericOrdering=false index: item1 < item10 < item2
+SELECT entry->>'offset' AS offset,
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+FROM documentdb_api_internal.documentdb_rum_page_get_entries(
+    public.get_raw_page('documentdb_data.documents_rum_index_8125', 1), 
+    'documentdb_data.documents_rum_index_8125'::regclass
+) entry;
+
+
+-- ===== Section 13: Three-key compound with numericOrdering=true ======
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_three_key",
+    "indexes": [{
+      "key": { "region": 1, "code": 1, "seq": 1 },
+      "name": "region_code_seq_numord_idx",
+      "collation": { "locale": "en", "numericOrdering": true }
+    }]
+  }',
+  TRUE
+);
+
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_three_key', '{"_id": 1, "region": "us-east-1", "code": "code1", "seq": 10}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_three_key', '{"_id": 2, "region": "us-east-10", "code": "code2", "seq": 20}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_three_key', '{"_id": 3, "region": "us-east-2", "code": "code10", "seq": 30}', NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_three_key', '{"_id": 4, "region": "us-west-1", "code": "code3", "seq": 40}', NULL);
+
+\d documentdb_data.documents_8113
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_three_key"}');
+
+-- Three-key numericOrdering=true: region sorted numerically (us-east-1 < us-east-2 < us-east-10 < us-west-1)
+SELECT entry->>'offset' AS offset,
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+FROM documentdb_api_internal.documentdb_rum_page_get_entries(
+    public.get_raw_page('documentdb_data.documents_rum_index_8127', 1), 
+    'documentdb_data.documents_rum_index_8127'::regclass
+) entry;
+
+
+-- ===== Section 14: Truncated long strings with numericOrdering=true ======
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+  'ord_coll_ordered_db',
+  '{
+    "createIndexes": "ord_truncated",
+    "indexes": [{
+      "key": { "longfield": 1, "tag": 1 },
+      "name": "longfield_tag_numord_true_idx",
+      "collation": { "locale": "en", "numericOrdering": true }
+    }]
+  }',
+  TRUE
+);
+
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_truncated',
+  bson_build_document('_id'::text, 1, 'longfield'::text, ('item1' || repeat('x', 3000))::text, 'tag'::text, 'A'::text), NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_truncated',
+  bson_build_document('_id'::text, 2, 'longfield'::text, ('item10' || repeat('x', 3000))::text, 'tag'::text, 'B'::text), NULL);
+SELECT documentdb_api.insert_one('ord_coll_ordered_db', 'ord_truncated',
+  bson_build_document('_id'::text, 3, 'longfield'::text, ('item2' || repeat('y', 3000))::text, 'tag'::text, 'C'::text), NULL);
+
+\d documentdb_data.documents_8114
+SELECT cursorpage FROM documentdb_api.list_indexes_cursor_first_page('ord_coll_ordered_db', '{"listIndexes": "ord_truncated"}');
+
+-- Truncated with numericOrdering=true: item1... < item2... < item10... ; $flags=1 indicates truncation
+SELECT entry->>'offset' AS offset,
+       collation_ordered_test_schema.gin_bson_index_term_to_bson((entry->>'firstEntry')::bytea) AS index_term
+FROM documentdb_api_internal.documentdb_rum_page_get_entries(
+    public.get_raw_page('documentdb_data.documents_rum_index_8129', 1), 
+    'documentdb_data.documents_rum_index_8129'::regclass
+) entry;
+
+
+-- ===== Section 15: Query with matching collation (index pushdown not yet supported) ======
+BEGIN;
+SET LOCAL enable_seqscan TO OFF;
+SELECT document FROM bson_aggregation_find('ord_coll_ordered_db', '{ "find": "ord_numord_true", "filter": { "item": { "$eq": "item1" } }, "collation": { "locale": "en", "numericOrdering": true } }');
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('ord_coll_ordered_db', '{ "find": "ord_numord_true", "filter": { "item": { "$eq": "item1" } }, "collation": { "locale": "en", "numericOrdering": true } }');
+ROLLBACK;
+
+BEGIN;
+SET LOCAL enable_seqscan TO OFF;
+SELECT document FROM bson_aggregation_find('ord_coll_ordered_db', '{ "find": "ord_compound_numord_true", "filter": { "item": { "$eq": "item1" } }, "collation": { "locale": "en", "numericOrdering": true } }');
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('ord_coll_ordered_db', '{ "find": "ord_compound_numord_true", "filter": { "item": { "$eq": "item1" } }, "collation": { "locale": "en", "numericOrdering": true } }');
+ROLLBACK;
+
+
+DROP SCHEMA collation_ordered_test_schema CASCADE;
+
+RESET documentdb.enableCollationWithNonUniqueOrderedIndexes;
+RESET documentdb.defaultUseCompositeOpClass;
 RESET documentdb_core.enableCollation;

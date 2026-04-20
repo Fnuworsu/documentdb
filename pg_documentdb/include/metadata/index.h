@@ -322,8 +322,14 @@ uint64 * GetCollectionIdsForIndexBuild(List *excludeCollectionIds);
 void AddRequestInIndexQueue(char *createIndexCmd, int indexId, uint64 collectionId, char
 							cmd_type, Oid userOid);
 char * GetIndexQueueName(void);
+char * GetIndexQueueTableName(void);
 void CreateIndexQueueIfNotExists(bool includeOptions, bool includeDropCommandType);
 const char * GetIndexTypeFromKeyDocument(pgbson *keyDocument);
+
+void UpdateIndexStatisticsForPlannerStatistics(uint64 collectionId, List *indexIdList);
+void UpdateCollectionPlannerStatistics(uint64 collectionId, bool enableStats);
+void DropIndexStatisticsForPlannerStatistics(uint64 collectionId, List *indexIdList);
+bool CollectionHasStatisticsEnabled(uint64 collectionId);
 
 /* Static utilities */
 

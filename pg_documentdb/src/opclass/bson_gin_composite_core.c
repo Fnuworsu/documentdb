@@ -92,9 +92,9 @@ static void SetBoundsForNotEqual(const bson_value_t *queryValue,
 
 
 static void SetUpperBound(CompositeSingleBound *currentBoundValue, const
-						  CompositeSingleBound *upperBound);
+						  CompositeSingleBound *upperBound, const char *indexCollation);
 static void SetLowerBound(CompositeSingleBound *currentBoundValue, const
-						  CompositeSingleBound *lowerBound);
+						  CompositeSingleBound *lowerBound, const char *indexCollation);
 
 static void AddMultiBoundaryForDollarIn(int32_t indexAttribute, const char *wildcardPath,
 										pgbsonelement *queryElement,
@@ -253,16 +253,18 @@ static void
 MergeSingleCompositeIndexBounds(CompositeIndexBounds *sourceBound,
 								CompositeIndexBounds *targetBound)
 {
+	const char *indexCollation = NULL;
+
 	if (sourceBound->lowerBound.bound.value_type != BSON_TYPE_EOD)
 	{
 		SetLowerBound(&targetBound->lowerBound,
-					  &sourceBound->lowerBound);
+					  &sourceBound->lowerBound, indexCollation);
 	}
 
 	if (sourceBound->upperBound.bound.value_type != BSON_TYPE_EOD)
 	{
 		SetUpperBound(&targetBound->upperBound,
-					  &sourceBound->upperBound);
+					  &sourceBound->upperBound, indexCollation);
 	}
 
 	if (sourceBound->indexRecheckFunctions != NIL)
@@ -343,16 +345,17 @@ UpdateRunDataForVariableBounds(CompositeQueryRunData *runData,
 
 		/* Update the runData with the selected bounds for this index attribute */
 		CompositeIndexBounds *bound = &set->bounds[index];
+		const char *indexCollation = NULL;
 		if (bound->lowerBound.bound.value_type != BSON_TYPE_EOD)
 		{
 			SetLowerBound(&runData->indexBounds[set->indexAttribute].lowerBound,
-						  &bound->lowerBound);
+						  &bound->lowerBound, indexCollation);
 		}
 
 		if (bound->upperBound.bound.value_type != BSON_TYPE_EOD)
 		{
 			SetUpperBound(&runData->indexBounds[set->indexAttribute].upperBound,
-						  &bound->upperBound);
+						  &bound->upperBound, indexCollation);
 		}
 
 		if (bound->indexRecheckFunctions != NIL)
@@ -435,6 +438,7 @@ UpdateRunDataForOrderedBounds(CompositeQueryRunData *runData,
 
 		ListCell *cell;
 		bool checkForUnsatisfiability = true;
+		const char *indexCollation = NULL;
 		foreach(cell, entriesForPath)
 		{
 			CompositeProcessedPerPathEntry *entry =
@@ -479,10 +483,10 @@ UpdateRunDataForOrderedBounds(CompositeQueryRunData *runData,
 			{
 				SetLowerBound(&runData->indexBounds[i].lowerBound,
 							  &entry->boundsSet->bounds[entry->currentOperatorIndex].
-							  lowerBound);
+							  lowerBound, indexCollation);
 				SetUpperBound(&runData->indexBounds[i].upperBound,
 							  &entry->boundsSet->bounds[entry->currentOperatorIndex].
-							  upperBound);
+							  upperBound, indexCollation);
 				runData->indexBounds->requiresRuntimeRecheck =
 					runData->indexBounds->requiresRuntimeRecheck ||
 					entry->boundsSet->bounds[entry
@@ -548,19 +552,20 @@ UpdateRunDataForOrderedBounds(CompositeQueryRunData *runData,
 
 
 static void
-MergeBoundsForBoundsSet(CompositeIndexBoundsSet *set, CompositeIndexBounds *mergedBounds)
+MergeBoundsForBoundsSet(CompositeIndexBoundsSet *set, CompositeIndexBounds *mergedBounds,
+						const char *indexCollation)
 {
 	CompositeIndexBounds *bound = &set->bounds[0];
 	if (bound->lowerBound.bound.value_type != BSON_TYPE_EOD)
 	{
 		SetLowerBound(&mergedBounds[set->indexAttribute].lowerBound,
-					  &bound->lowerBound);
+					  &bound->lowerBound, indexCollation);
 	}
 
 	if (bound->upperBound.bound.value_type != BSON_TYPE_EOD)
 	{
 		SetUpperBound(&mergedBounds[set->indexAttribute].upperBound,
-					  &bound->upperBound);
+					  &bound->upperBound, indexCollation);
 	}
 
 	mergedBounds[set->indexAttribute].requiresRuntimeRecheck =
@@ -619,7 +624,8 @@ MergeWildCardSingleVariableBounds(List *boundsList)
 															v_int32);
 
 			/* Merge the current set into the target */
-			MergeBoundsForBoundsSet(set, &(existingSet->bounds[0]));
+			const char *indexCollation = NULL;
+			MergeBoundsForBoundsSet(set, &(existingSet->bounds[0]), indexCollation);
 		}
 	}
 
@@ -633,7 +639,7 @@ MergeWildCardSingleVariableBounds(List *boundsList)
 
 List *
 MergeSingleVariableBounds(List *boundsList, const char **wildcardPath,
-						  CompositeIndexBounds *mergedBounds)
+						  CompositeIndexBounds *mergedBounds, const char *indexCollation)
 {
 	ListCell *cell;
 	foreach(cell, boundsList)
@@ -651,7 +657,7 @@ MergeSingleVariableBounds(List *boundsList, const char **wildcardPath,
 								"Unexpected, should not have wildcardPath in single variable bounds merge")));
 		}
 
-		MergeBoundsForBoundsSet(set, mergedBounds);
+		MergeBoundsForBoundsSet(set, mergedBounds, indexCollation);
 
 
 		/* Postgres requires that we don't use cell or anything in foreach after
@@ -677,7 +683,8 @@ TrimSecondaryVariableBounds(VariableIndexBounds *variableBounds,
 		if (set->indexAttribute > 0)
 		{
 			runData->metaInfo->requiresRuntimeRecheck = true;
-			foreach_delete_current(variableBounds->variableBoundsList, cell);
+			variableBounds->variableBoundsList = foreach_delete_current(
+				variableBounds->variableBoundsList, cell);
 			continue;
 		}
 	}
@@ -723,7 +730,7 @@ PickVariableBoundsForOrderedScan(VariableIndexBounds *variableBounds,
 		}
 
 		/* Remove current index */
-		foreach_delete_current(
+		variableBounds->variableBoundsList = foreach_delete_current(
 			variableBounds->variableBoundsList, cell);
 	}
 }
@@ -930,6 +937,7 @@ ParseOperatorStrategyWithPath(int i, pgbsonelement *queryElement,
 	bool isNegationOp = false;
 
 	/* Now that we have the index path, add or update the bounds */
+	const char *indexCollation = NULL;
 	switch (queryStrategy)
 	{
 		/* Single bound operators */
@@ -989,12 +997,12 @@ ParseOperatorStrategyWithPath(int i, pgbsonelement *queryElement,
 				CompositeSingleBound minKeyBounds = { 0 };
 				minKeyBounds.bound.value_type = BSON_TYPE_MINKEY;
 				minKeyBounds.isBoundInclusive = false;
-				SetLowerBound(&set->bounds[0].lowerBound, &minKeyBounds);
+				SetLowerBound(&set->bounds[0].lowerBound, &minKeyBounds, indexCollation);
 
 				CompositeSingleBound nullBounds = { 0 };
 				nullBounds.bound.value_type = BSON_TYPE_NULL;
 				nullBounds.isBoundInclusive = true;
-				SetUpperBound(&set->bounds[0].upperBound, &nullBounds);
+				SetUpperBound(&set->bounds[0].upperBound, &nullBounds, indexCollation);
 
 				bool *existsValue = (bool *) palloc(sizeof(bool));
 				*existsValue = false;
@@ -1049,10 +1057,10 @@ ParseOperatorStrategyWithPath(int i, pgbsonelement *queryElement,
 			CompositeIndexBoundsSet *set = CreateAndRegisterSingleIndexBoundsSet(
 				indexBounds, i, wildcardPath);
 			CompositeSingleBound bounds = GetTypeLowerBound(BSON_TYPE_DOUBLE);
-			SetLowerBound(&set->bounds[0].lowerBound, &bounds);
+			SetLowerBound(&set->bounds[0].lowerBound, &bounds, indexCollation);
 
 			bounds = GetTypeUpperBound(BSON_TYPE_DOUBLE);
-			SetUpperBound(&set->bounds[0].upperBound, &bounds);
+			SetUpperBound(&set->bounds[0].upperBound, &bounds, indexCollation);
 
 			bson_value_t *modFilter = palloc(sizeof(bson_value_t));
 			*modFilter = queryElement->bsonValue;
@@ -1171,6 +1179,7 @@ ParseOperatorStrategyWithPath(int i, pgbsonelement *queryElement,
 
 		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY:
 		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_INDEXTERM:
 		{
 			/* It's a full scan */
 			break;
@@ -1198,7 +1207,8 @@ ParseOperatorStrategyWithPath(int i, pgbsonelement *queryElement,
 
 bool
 IsValidRecheckForIndexValue(const BsonIndexTerm *compareTerm,
-							IndexRecheckArgs *recheckArgs)
+							IndexRecheckArgs *recheckArgs,
+							const char *indexCollation)
 {
 	switch (recheckArgs->queryStrategy)
 	{
@@ -1260,7 +1270,8 @@ IsValidRecheckForIndexValue(const BsonIndexTerm *compareTerm,
 				return !IsIndexTermMaybeUndefined(compareTerm);
 			}
 
-			return !BsonValueEquals(&compareTerm->element.bsonValue, notEqualQuery);
+			return !BsonValueEqualsWithCollation(&compareTerm->element.bsonValue,
+												 notEqualQuery, indexCollation);
 		}
 
 		case BSON_INDEX_STRATEGY_DOLLAR_BITS_ALL_CLEAR:
@@ -1331,6 +1342,7 @@ IsValidRecheckForIndexValue(const BsonIndexTerm *compareTerm,
 		case BSON_INDEX_STRATEGY_DOLLAR_NOT_LTE:
 		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY:
 		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_INDEXTERM:
 		{
 			/* No recheck */
 			ereport(ERROR, (errmsg(
@@ -1380,7 +1392,7 @@ ProcessBoundForQuery(CompositeSingleBound *bound, const char *path,
 
 static void
 SetLowerBound(CompositeSingleBound *currentBoundValue, const
-			  CompositeSingleBound *lowerBound)
+			  CompositeSingleBound *lowerBound, const char *indexCollation)
 {
 	if (currentBoundValue->bound.value_type == BSON_TYPE_EOD)
 	{
@@ -1389,9 +1401,10 @@ SetLowerBound(CompositeSingleBound *currentBoundValue, const
 	else
 	{
 		bool isComparisonValid = false;
-		int32_t comparison = CompareBsonValueAndType(&currentBoundValue->bound,
-													 &lowerBound->bound,
-													 &isComparisonValid);
+		int32_t comparison = CompareBsonValueAndTypeWithCollation(
+			&currentBoundValue->bound,
+			&lowerBound->bound,
+			&isComparisonValid, indexCollation);
 
 		if (comparison == 0)
 		{
@@ -1413,7 +1426,7 @@ SetLowerBound(CompositeSingleBound *currentBoundValue, const
 
 static void
 SetUpperBound(CompositeSingleBound *currentBoundValue, const
-			  CompositeSingleBound *upperBound)
+			  CompositeSingleBound *upperBound, const char *indexCollation)
 {
 	if (currentBoundValue->bound.value_type == BSON_TYPE_EOD)
 	{
@@ -1422,9 +1435,10 @@ SetUpperBound(CompositeSingleBound *currentBoundValue, const
 	else
 	{
 		bool isComparisonValid = false;
-		int32_t comparison = CompareBsonValueAndType(&currentBoundValue->bound,
-													 &upperBound->bound,
-													 &isComparisonValid);
+		int32_t comparison = CompareBsonValueAndTypeWithCollation(
+			&currentBoundValue->bound,
+			&upperBound->bound,
+			&isComparisonValid, indexCollation);
 
 		if (comparison == 0)
 		{
@@ -1447,15 +1461,17 @@ SetUpperBound(CompositeSingleBound *currentBoundValue, const
 static void
 SetBoundsExistsTrue(CompositeIndexBounds *queryBounds)
 {
+	const char *indexCollation = NULL;
+
 	/* This is similar to $exists: true */
 	CompositeSingleBound bounds = { 0 };
 	bounds.bound.value_type = BSON_TYPE_MINKEY;
 	bounds.isBoundInclusive = true;
-	SetLowerBound(&queryBounds->lowerBound, &bounds);
+	SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 
 	bounds.bound.value_type = BSON_TYPE_MAXKEY;
 	bounds.isBoundInclusive = true;
-	SetUpperBound(&queryBounds->upperBound, &bounds);
+	SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 
 	bool *existsValue = (bool *) palloc(sizeof(bool));
 	*existsValue = true;
@@ -1498,20 +1514,21 @@ SetEqualityBound(const bson_value_t *queryValue, CompositeIndexBounds *queryBoun
 	equalsBounds.bound = *queryValue;
 	equalsBounds.isBoundInclusive = true;
 
+	const char *indexCollation = NULL;
 	if (queryValue->value_type == BSON_TYPE_NULL)
 	{
 		/* For null we set the lower bound to be > MinKey so we capture undefined values as well. */
 		CompositeSingleBound minNullBound = { 0 };
 		minNullBound.bound.value_type = BSON_TYPE_MINKEY;
 		minNullBound.isBoundInclusive = false;
-		SetLowerBound(&queryBounds->lowerBound, &minNullBound);
+		SetLowerBound(&queryBounds->lowerBound, &minNullBound, indexCollation);
 	}
 	else
 	{
-		SetLowerBound(&queryBounds->lowerBound, &equalsBounds);
+		SetLowerBound(&queryBounds->lowerBound, &equalsBounds, indexCollation);
 	}
 
-	SetUpperBound(&queryBounds->upperBound, &equalsBounds);
+	SetUpperBound(&queryBounds->upperBound, &equalsBounds, indexCollation);
 
 	if (queryValue->value_type == BSON_TYPE_NULL)
 	{
@@ -1593,23 +1610,24 @@ SetGreaterThanBounds(const bson_value_t *queryValue,
 		bounds.isBoundInclusive = isMinBoundInclusive;
 	}
 
-	SetLowerBound(&queryBounds->lowerBound, &bounds);
+	const char *indexCollation = NULL;
+	SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 
 	/* Apply type bracketing unless requested to skip */
 	if (compareValue.value_type == BSON_TYPE_MINKEY || skipTypeBracketing)
 	{
 		bounds = GetTypeUpperBound(BSON_TYPE_MAXKEY);
-		SetUpperBound(&queryBounds->upperBound, &bounds);
+		SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 	}
 	else if (IsBsonValueNaN(queryValue))
 	{
 		/* Range should just be [ > NaN, < NaN ] */
-		SetUpperBound(&queryBounds->upperBound, &bounds);
+		SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 	}
 	else
 	{
 		bounds = GetTypeUpperBound(queryValue->value_type);
-		SetUpperBound(&queryBounds->upperBound, &bounds);
+		SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 	}
 
 	if (queryValue->value_type == BSON_TYPE_NULL)
@@ -1629,6 +1647,8 @@ SetLessThanBounds(const bson_value_t *queryValue,
 	bool skipTypeBracketing = false;
 	bool isUpperBoundInclusive =
 		queryStrategy == BSON_INDEX_STRATEGY_DOLLAR_LESS_EQUAL;
+
+	const char *indexCollation = NULL;
 	if (compareValue.value_type == BSON_TYPE_ARRAY)
 	{
 		/* Arrays require runtime recheck on the greater than value */
@@ -1672,18 +1692,18 @@ SetLessThanBounds(const bson_value_t *queryValue,
 	CompositeSingleBound bounds = { 0 };
 	bounds.bound = compareValue;
 	bounds.isBoundInclusive = isUpperBoundInclusive;
-	SetUpperBound(&queryBounds->upperBound, &bounds);
+	SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 
 	/* Apply type bracketing */
 	if (compareValue.value_type == BSON_TYPE_MAXKEY || skipTypeBracketing)
 	{
 		bounds = GetTypeLowerBound(BSON_TYPE_MINKEY);
-		SetLowerBound(&queryBounds->lowerBound, &bounds);
+		SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 	}
 	else if (IsBsonValueNaN(&compareValue))
 	{
 		/* Range should just be [NaN, NaN]. */
-		SetLowerBound(&queryBounds->lowerBound, &bounds);
+		SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 	}
 	else if (compareValue.value_type == BSON_TYPE_NULL &&
 			 queryStrategy == BSON_INDEX_STRATEGY_DOLLAR_LESS_EQUAL)
@@ -1691,12 +1711,12 @@ SetLessThanBounds(const bson_value_t *queryValue,
 		/* Special case, null is always inclusive */
 		bounds.bound.value_type = BSON_TYPE_MINKEY;
 		bounds.isBoundInclusive = false;
-		SetLowerBound(&queryBounds->lowerBound, &bounds);
+		SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 	}
 	else
 	{
 		bounds = GetTypeLowerBound(compareValue.value_type);
-		SetLowerBound(&queryBounds->lowerBound, &bounds);
+		SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 	}
 
 	if (compareValue.value_type == BSON_TYPE_NULL)
@@ -1711,11 +1731,13 @@ static void
 SetBoundsForNotEqual(const bson_value_t *queryValue,
 					 CompositeIndexBounds *queryBounds)
 {
+	const char *indexCollation = NULL;
+
 	CompositeSingleBound bounds = GetTypeLowerBound(BSON_TYPE_MINKEY);
-	SetLowerBound(&queryBounds->lowerBound, &bounds);
+	SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 
 	bounds = GetTypeUpperBound(BSON_TYPE_MAXKEY);
-	SetUpperBound(&queryBounds->upperBound, &bounds);
+	SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 
 	bson_value_t *equalsValue = palloc0(sizeof(bson_value_t));
 	*equalsValue = *queryValue;
@@ -1838,6 +1860,8 @@ OptimizeBoundaryForRegexExpression(RegexData *regexData,
 	StringView strView = regexData->regex != NULL ? CreateStringViewFromString(
 		regexData->regex) : CreateStringViewFromString("");
 
+	const char *indexCollation = NULL;
+
 	/* We can only optimize if we have no options and the regex starts with ^ */
 	if (!EnableRegexPrefixIndexBounds ||
 		strcmp(regexData->options, "") != 0 ||
@@ -1845,17 +1869,17 @@ OptimizeBoundaryForRegexExpression(RegexData *regexData,
 	{
 		/* Set the bounds to be all strings since we can't optimize based on the regex expression */
 		CompositeSingleBound bounds = GetTypeLowerBound(BSON_TYPE_UTF8);
-		SetLowerBound(&queryBounds->lowerBound, &bounds);
+		SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 
 		bounds = GetTypeUpperBound(BSON_TYPE_UTF8);
-		SetUpperBound(&queryBounds->upperBound, &bounds);
+		SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 		return;
 	}
 
 	strView = StringViewSubstring(&strView, 1); /* skip the '^' character */
 	char *anchorPrefixBuffer = palloc0(sizeof(char) * (strView.length + 1));
 	uint32_t prefixLength = 0;
-	int32_t firstNonAsciiByteIndex = -1;
+	int32_t lastNonAsciiCodepointStart = -1;
 
 	uint32_t i = 0;
 	for (; i < strView.length; i++)
@@ -1894,15 +1918,19 @@ OptimizeBoundaryForRegexExpression(RegexData *regexData,
 			break;
 		}
 
-		/* Record the first non-ASCII byte index in the prefix, in case the last codepoint in the prefix is non-ASCII.
-		 * If we find an ASCII character after a non-ASCII character, reset the index. */
-		if (firstNonAsciiByteIndex == -1 && !isascii(currentChar))
+		/* Track the start of non-ASCII UTF-8 codepoints as we build the prefix */
+		if (!isascii((unsigned char) currentChar))
 		{
-			firstNonAsciiByteIndex = i;
+			/* If this is a UTF-8 start byte (not continuation), update the position. We need to check this in case we have 2 UTF8 codepoints in a row at the end of the prefix i.e (^éñ.) */
+			if (!is_utf8_continuation_byte(currentChar))
+			{
+				lastNonAsciiCodepointStart = prefixLength;
+			}
 		}
-		else if (firstNonAsciiByteIndex >= 0 && isascii(currentChar))
+		else
 		{
-			firstNonAsciiByteIndex = -1;
+			/* ASCII character resets - we only care about trailing non-ASCII codepoints */
+			lastNonAsciiCodepointStart = -1;
 		}
 
 		anchorPrefixBuffer[prefixLength++] = currentChar;
@@ -1918,19 +1946,19 @@ OptimizeBoundaryForRegexExpression(RegexData *regexData,
 		bounds.bound.value.v_utf8.str = lowerBoundary;
 		bounds.bound.value.v_utf8.len = prefixLength;
 		bounds.isBoundInclusive = true;
-		SetLowerBound(&queryBounds->lowerBound, &bounds);
+		SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 
 		char *upperBoundary = NULL;
 		uint32_t upperBoundaryLength = 0;
 		bool hasUpperBoundary = false;
-		if (firstNonAsciiByteIndex >= 0)
+		if (lastNonAsciiCodepointStart >= 0)
 		{
 			hasUpperBoundary = TryBuildNextUtf8PrefixBoundary(anchorPrefixBuffer,
-															  firstNonAsciiByteIndex,
+															  lastNonAsciiCodepointStart,
 															  &upperBoundary,
 															  &upperBoundaryLength);
 		}
-		else
+		else if (anchorPrefixBuffer[prefixLength - 1] < UTF8_MAX_1BYTE_CODEPOINT)
 		{
 			upperBoundary = pnstrdup(anchorPrefixBuffer, prefixLength);
 			upperBoundary[prefixLength - 1]++;
@@ -1943,24 +1971,26 @@ OptimizeBoundaryForRegexExpression(RegexData *regexData,
 			bounds.bound.value.v_utf8.str = upperBoundary;
 			bounds.bound.value.v_utf8.len = upperBoundaryLength;
 			bounds.isBoundInclusive = false;
-			SetUpperBound(&queryBounds->upperBound, &bounds);
+			SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 		}
 		else
 		{
 			/* Invalid/increment-exhausted UTF-8 prefixes fall back to full UTF-8 type bounds. */
 			bounds = GetTypeUpperBound(BSON_TYPE_UTF8);
-			SetUpperBound(&queryBounds->upperBound, &bounds);
+			SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 		}
 
 		pfree(anchorPrefixBuffer);
 		return;
 	}
 
+	pfree(anchorPrefixBuffer);
+
 	/* If we can't optimize based on the regex expression, set the bounds to be all strings. */
 	CompositeSingleBound bounds = GetTypeLowerBound(BSON_TYPE_UTF8);
-	SetLowerBound(&queryBounds->lowerBound, &bounds);
+	SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 	bounds = GetTypeUpperBound(BSON_TYPE_UTF8);
-	SetUpperBound(&queryBounds->upperBound, &bounds);
+	SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 }
 
 
@@ -1990,11 +2020,12 @@ SetSingleBoundsDollarRegex(const bson_value_t *queryValue,
 	}
 	else
 	{
+		const char *indexCollation = NULL;
 		CompositeSingleBound bounds = GetTypeLowerBound(BSON_TYPE_MINKEY);
-		SetLowerBound(&queryBounds->lowerBound, &bounds);
+		SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 
 		bounds = GetTypeUpperBound(BSON_TYPE_MAXKEY);
-		SetUpperBound(&queryBounds->upperBound, &bounds);
+		SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 	}
 
 	regexData->pcreData = RegexCompile(regexData->regex,
@@ -2050,11 +2081,12 @@ SetSingleBoundsDollarType(const bson_value_t *queryValue,
 		return;
 	}
 
+	const char *indexCollation = NULL;
 	CompositeSingleBound bounds = GetTypeLowerBound(typeValue);
-	SetLowerBound(&queryBounds->lowerBound, &bounds);
+	SetLowerBound(&queryBounds->lowerBound, &bounds, indexCollation);
 
 	bounds = GetTypeUpperBound(typeValue);
-	SetUpperBound(&queryBounds->upperBound, &bounds);
+	SetUpperBound(&queryBounds->upperBound, &bounds, indexCollation);
 
 	/* TODO(Composite): Why does this need a runtime recheck */
 	queryBounds->requiresRuntimeRecheck = true;
@@ -2267,8 +2299,10 @@ AddMultiBoundaryForDollarRegex(int32_t indexAttribute, const char *wildcardPath,
 	CompositeSingleBound equalsBounds = { 0 };
 	equalsBounds.bound = queryElement->bsonValue;
 	equalsBounds.isBoundInclusive = true;
-	SetLowerBound(&set->bounds[1].lowerBound, &equalsBounds);
-	SetUpperBound(&set->bounds[1].upperBound, &equalsBounds);
+
+	const char *indexCollation = NULL;
+	SetLowerBound(&set->bounds[1].lowerBound, &equalsBounds, indexCollation);
+	SetUpperBound(&set->bounds[1].upperBound, &equalsBounds, indexCollation);
 
 	if (indexBounds != NULL)
 	{
@@ -2294,20 +2328,22 @@ AddMultiBoundaryForBitwiseOperator(BsonIndexStrategy strategy,
 	args->queryDatum = (Pointer) modFilter;
 	args->queryStrategy = strategy;
 
+	const char *indexCollation = NULL;
+
 	/* First bound is all numbers */
 	CompositeSingleBound bound = GetTypeLowerBound(BSON_TYPE_DOUBLE);
-	SetLowerBound(&set->bounds[0].lowerBound, &bound);
+	SetLowerBound(&set->bounds[0].lowerBound, &bound, indexCollation);
 	bound = GetTypeUpperBound(BSON_TYPE_DOUBLE);
-	SetUpperBound(&set->bounds[0].upperBound, &bound);
+	SetUpperBound(&set->bounds[0].upperBound, &bound, indexCollation);
 
 	set->bounds[0].indexRecheckFunctions =
 		lappend(set->bounds[0].indexRecheckFunctions, args);
 
 	/* Second bound is all binary */
 	bound = GetTypeLowerBound(BSON_TYPE_BINARY);
-	SetLowerBound(&set->bounds[1].lowerBound, &bound);
+	SetLowerBound(&set->bounds[1].lowerBound, &bound, indexCollation);
 	bound = GetTypeUpperBound(BSON_TYPE_BINARY);
-	SetUpperBound(&set->bounds[1].upperBound, &bound);
+	SetUpperBound(&set->bounds[1].upperBound, &bound, indexCollation);
 	set->bounds[1].indexRecheckFunctions =
 		lappend(set->bounds[1].indexRecheckFunctions, args);
 
@@ -2330,12 +2366,14 @@ AddMultiBoundaryForNotGreater(int32_t indexAttribute, const char *wildcardPath,
 	/* For $gte is [minBound -> TypeMAX] */
 	/* The inverse set to this is [MinKey -> minBound ) || (TypeMax -> MaxKey ]*/
 
+	const char *indexCollation = NULL;
+
 	/* First bound is [MinKey -> minBound ] */
 	CompositeSingleBound bound = GetTypeLowerBound(BSON_TYPE_MINKEY);
-	SetLowerBound(&set->bounds[0].lowerBound, &bound);
+	SetLowerBound(&set->bounds[0].lowerBound, &bound, indexCollation);
 	bound.bound = queryElement->bsonValue;
 	bound.isBoundInclusive = !isEquals;
-	SetUpperBound(&set->bounds[0].upperBound, &bound);
+	SetUpperBound(&set->bounds[0].upperBound, &bound, indexCollation);
 
 	/* Upper bound here is the type value and not equals. However, for null,
 	 * not equal to null also excludes undefined values which has empty arrays.
@@ -2352,10 +2390,10 @@ AddMultiBoundaryForNotGreater(int32_t indexAttribute, const char *wildcardPath,
 
 	/* If the bound includes the largest value of the current type, forcibly exclude it */
 	bound.isBoundInclusive = false;
-	SetLowerBound(&set->bounds[1].lowerBound, &bound);
+	SetLowerBound(&set->bounds[1].lowerBound, &bound, indexCollation);
 
 	bound = GetTypeUpperBound(BSON_TYPE_MAXKEY);
-	SetUpperBound(&set->bounds[1].upperBound, &bound);
+	SetUpperBound(&set->bounds[1].upperBound, &bound, indexCollation);
 
 	/*
 	 * Not functions need recheck for arrays ( given "a": [ 1, 2 ]:
@@ -2380,14 +2418,16 @@ AddMultiBoundaryForNotLess(int32_t indexAttribute, const char *wildcardPath,
 	/* For $lte is [TypeMin -> maxBound] */
 	/* The inverse set to this is [MinKey -> TypeMin ) || (maxBound -> MaxKey ]*/
 
+	const char *indexCollation = NULL;
+
 	/* First bound is [MinKey -> TypeMin ] */
 	CompositeSingleBound bound = GetTypeLowerBound(BSON_TYPE_MINKEY);
-	SetLowerBound(&set->bounds[0].lowerBound, &bound);
+	SetLowerBound(&set->bounds[0].lowerBound, &bound, indexCollation);
 
 	/* Upper bound is type min: We never include the min type value */
 	bound = GetTypeLowerBound(queryElement->bsonValue.value_type);
 	bound.isBoundInclusive = false;
-	SetUpperBound(&set->bounds[0].upperBound, &bound);
+	SetUpperBound(&set->bounds[0].upperBound, &bound, indexCollation);
 
 	/* If this first bound is NULL, we need to recheck due to empty arrays */
 	if (queryElement->bsonValue.value_type == BSON_TYPE_NULL)
@@ -2399,10 +2439,10 @@ AddMultiBoundaryForNotLess(int32_t indexAttribute, const char *wildcardPath,
 	/* Second bound is (maxBound -> MaxKey ] */
 	bound.bound = queryElement->bsonValue;
 	bound.isBoundInclusive = !isEquals;
-	SetLowerBound(&set->bounds[1].lowerBound, &bound);
+	SetLowerBound(&set->bounds[1].lowerBound, &bound, indexCollation);
 
 	bound = GetTypeUpperBound(BSON_TYPE_MAXKEY);
-	SetUpperBound(&set->bounds[1].upperBound, &bound);
+	SetUpperBound(&set->bounds[1].upperBound, &bound, indexCollation);
 
 	/*
 	 * Not functions need recheck for arrays ( given "a": [ 1, 2 ]:
@@ -2560,10 +2600,13 @@ AddMultiBoundaryForDollarRange(int32_t indexAttribute,
 			CompositeIndexBoundsSet *singleBounds = CreateAndRegisterSingleIndexBoundsSet(
 				&finalBounds, indexAttribute, wildcardPath);
 
+			/* TODO (COLLATION) */
+			const char *indexCollation = NULL;
 			int initialVariableBoundsCount = list_length(localBounds.variableBoundsList);
 			localBounds.variableBoundsList =
 				MergeSingleVariableBounds(localBounds.variableBoundsList,
-										  &nestedWildcardPath, singleBounds->bounds);
+										  &nestedWildcardPath, singleBounds->bounds,
+										  indexCollation);
 
 			if (list_length(localBounds.variableBoundsList) == initialVariableBoundsCount)
 			{

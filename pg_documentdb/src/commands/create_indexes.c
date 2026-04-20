@@ -60,6 +60,7 @@
 #include "utils/documentdb_errors.h"
 #include "utils/query_utils.h"
 #include "utils/feature_counter.h"
+#include "utils/hashset_utils.h"
 #include "utils/index_utils.h"
 #include "utils/version_utils.h"
 #include "vector/vector_common.h"
@@ -168,8 +169,10 @@ extern bool CreateTTLIndexAsCompositeByDefault;
 extern bool EnableCompositeReducedCorrelatedTerms;
 extern bool EnableUniqueCompositeReducedCorrelatedTerms;
 extern bool EnableCompositeShardDocumentTerms;
+extern bool EnablePerCollectionPlannerStatistics;
+extern bool EnableCompositeReducedCorrelatedTermsOnCommonSubPath;
 
-extern bool EnableCollationWithIndexes;
+extern bool EnableCollationWithNonUniqueOrderedIndexes;
 extern bool SkipFailOnCollation;
 
 extern char *AlternateIndexHandler;
@@ -217,6 +220,8 @@ static void EnsureIndexDefDocFieldType(const bson_iter_t *indexDefDocIter,
 static void EnsureIndexDefDocFieldConvertibleToBool(bson_iter_t *indexDefDocIter);
 static bool IsSupportedIndexVersion(int indexVersion);
 static void ThrowIndexDefDocMissingFieldError(const char *fieldName);
+static void UpdateUniqueIndexStatsForPostgresIndex(uint64 collectionId,
+												   List *indexIdList);
 static IndexDefKey * ParseIndexDefKeyDocument(const bson_iter_t *indexDefDocIter);
 static CosmosSearchOptions * ParseCosmosSearchOptionsDoc(const bson_iter_t *optsIter);
 static BsonIntermediatePathNode * ParseIndexDefWildcardProjDoc(const bson_iter_t *
@@ -624,7 +629,7 @@ command_fix_unique_index_stats_for_collection(PG_FUNCTION_ARGS)
 
 	if (indexIdList != NIL)
 	{
-		UpdateIndexStatsForPostgresIndex(collectionId, indexIdList);
+		UpdateUniqueIndexStatsForPostgresIndex(collectionId, indexIdList);
 	}
 
 	PG_RETURN_VOID();
@@ -1976,7 +1981,7 @@ ParseIndexDefDocumentInternal(const bson_iter_t *indexesArrayIter,
 		else if (strcmp(indexDefDocKey, "collation") == 0)
 		{
 			ReportFeatureUsage(FEATURE_COLLATION_CREATE_INDEX);
-			if (EnableCollationWithIndexes)
+			if (EnableCollationWithNonUniqueOrderedIndexes)
 			{
 				EnsureTopLevelFieldType("collation", &indexDefDocIter,
 										BSON_TYPE_DOCUMENT);
@@ -2333,7 +2338,7 @@ ParseIndexDefDocumentInternal(const bson_iter_t *indexesArrayIter,
 
 	/*
 	 * Validate collation compatibility with index types and options.
-	 * TODO: For now, plumb collation through only for single-path and wildcard indexes.
+	 * TODO (COLLATION): Collation is only supported for non-unique ordered (or composite) indexes.
 	 */
 	bool isUniqueOrBuildAsUniqueIndex = IsUniqueOrBuildAsUniqueIndex(indexDef);
 	bool hasApplicableCollation = IsCollationApplicable(indexDef->collationString);
@@ -2371,12 +2376,12 @@ ParseIndexDefDocumentInternal(const bson_iter_t *indexesArrayIter,
 								"Index type 'cosmosSearch' does not support collation")));
 		}
 
-		/* We do not yet support collation with composite indexes */
-		if (indexDef->enableCompositeTerm == BoolIndexOption_True)
+		/* Collation is only supported for ordered (composite) indexes */
+		if (indexDef->enableCompositeTerm != BoolIndexOption_True)
 		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_CANNOTCREATEINDEX),
 							errmsg(
-								"Collation is not yet supported for composite indexes")));
+								"Collation is only supported with ordered (or composite) indexes")));
 		}
 
 		/* We do not support collation with unique indexes yet */
@@ -2384,7 +2389,7 @@ ParseIndexDefDocumentInternal(const bson_iter_t *indexesArrayIter,
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg(
-								"Collation is not supported for unique indexes")));
+								"Collation is not yet supported for unique indexes")));
 		}
 	}
 
@@ -5777,7 +5782,15 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 									  (enableLargeIndexKeys ||
 									   isUsingCompositeOpClass);
 
-	bool hasApplicableCollation = IsCollationApplicable(collationString);
+	bool hasApplicableCollation = IsCollationValid(collationString);
+	char *collationArg = "";
+	if (hasApplicableCollation)
+	{
+		StringInfo collationArgStr = makeStringInfo();
+		appendStringInfo(collationArgStr, ",cl=%s",
+						 quote_literal_cstr(collationString));
+		collationArg = collationArgStr->data;
+	}
 
 	/* For unique with truncation, instead of creating a unique hash for every column, we simply create a single
 	 * value with a new operator that handles unique constraints. That way for a composite unique index, we support
@@ -5852,16 +5865,14 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 
 			appendStringInfo(indexExprStr,
 							 "%s document %s.bson_%s_single_path_ops"
-							 "(path='', iswildcard=true%s%s%s%s%s)",
+							 "(path='', iswildcard=true%s%s%s%s)",
 							 firstColumnWritten ? "," : "",
 							 indexAmOpClassCatalogSchema,
 							 indexAmSuffix,
 							 indexTermSizeLimitArg,
 							 wildcardIndexTruncatedPathLimit,
 							 useReducedWildcardOption,
-							 hasApplicableCollation ? ", collation=" : "",
-							 hasApplicableCollation ?
-							 quote_literal_cstr(collationString) : "");
+							 collationArg);
 
 			firstColumnWritten = true;
 		}
@@ -5884,16 +5895,14 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 			bool includeId = wpPathOps->idFieldInclusion == WP_IM_INCLUDE;
 			appendStringInfo(indexExprStr,
 							 "%s document %s.bson_%s_wildcard_project_path_ops"
-							 "(includeid=%s%s%s%s%s",
+							 "(includeid=%s%s%s%s",
 							 firstColumnWritten ? "," : "",
 							 indexAmOpClassCatalogSchema,
 							 indexAmSuffix,
 							 includeId ? "true" : "false",
 							 indexTermSizeLimitArg,
 							 wildcardIndexTruncatedPathLimit,
-							 hasApplicableCollation ? ", collation=" : "",
-							 hasApplicableCollation ?
-							 quote_literal_cstr(collationString) : "");
+							 collationArg);
 
 			firstColumnWritten = true;
 
@@ -5945,7 +5954,18 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 		pgbson_array_writer arrayWriter;
 		PgbsonWriterStartArray(&elementListWriter, "", 0, &arrayWriter);
 
+		bool useReducedCorrelatedTerms = false;
+
+		bool isUniqueStyleIndex = unique || buildAsUnique;
+		if (list_length(indexDefKey->keyPathList) > 1 &&
+			((EnableCompositeReducedCorrelatedTerms && !isUniqueStyleIndex) ||
+			 (EnableUniqueCompositeReducedCorrelatedTerms && isUniqueStyleIndex)))
+		{
+			useReducedCorrelatedTerms = true;
+		}
+
 		int32_t wildcardTermIndex = -1;
+		int32_t numPathsWithCommonPrefix = 0;
 		if (list_length(indexDefKey->keyPathList) == 0)
 		{
 			/* root wildcard index */
@@ -5967,6 +5987,7 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 		{
 			ListCell *keyPathCell = NULL;
 			int numPaths = 0;
+			HTAB *pathHash = CreateStringViewHashSet();
 			foreach(keyPathCell, indexDefKey->keyPathList)
 			{
 				IndexDefKeyPath *indexKeyPath = (IndexDefKeyPath *) lfirst(keyPathCell);
@@ -5982,6 +6003,22 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 					}
 
 					wildcardTermIndex = foreach_current_index(keyPathCell);
+				}
+
+				/* Track number of index paths with dots*/
+				StringView keyPathView = CreateStringViewFromString(keyPath);
+				StringView dottedPrefix = StringViewFindPrefix(&keyPathView, '.');
+				if (dottedPrefix.length > 0 && !StringViewEqualsCString(&dottedPrefix,
+																		"_id"))
+				{
+					bool found = false;
+					hash_search(pathHash, &dottedPrefix, HASH_ENTER, &found);
+
+					if (found)
+					{
+						/* We have 2 index paths for a common prefix, track this */
+						numPathsWithCommonPrefix++;
+					}
 				}
 
 				numPaths++;
@@ -6028,6 +6065,8 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 								errmsg("Index exceeds maximum supported keys of %d",
 									   INDEX_MAX_KEYS)));
 			}
+
+			hash_destroy(pathHash);
 		}
 
 		PgbsonWriterEndArray(&elementListWriter, &arrayWriter);
@@ -6035,16 +6074,19 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 		pg_sprintf(indexTermSizeLimitArg, ",tl=%u", ComputeIndexTermLimit(
 					   COMPOUND_INDEX_TERM_SIZE_LIMIT));
 
+		if (numPathsWithCommonPrefix > 0 &&
+			EnableCompositeReducedCorrelatedTermsOnCommonSubPath)
+		{
+			useReducedCorrelatedTerms = true;
+		}
+
 		char wildcardIndexPath[22] = { 0 };
 		char wildcardIndexTruncatedPathLimit[22] = { 0 };
 		char *wildCardIndexPathLimit = "";
 		char *wildcardIndexString = "";
 		char *reducedCorrelatedTermString = "";
 
-		bool isUniqueStyleIndex = unique || buildAsUnique;
-		if (list_length(indexDefKey->keyPathList) > 1 &&
-			((EnableCompositeReducedCorrelatedTerms && !isUniqueStyleIndex) ||
-			 (EnableUniqueCompositeReducedCorrelatedTerms && isUniqueStyleIndex)))
+		if (useReducedCorrelatedTerms)
 		{
 			reducedCorrelatedTermString = ",rct=true";
 		}
@@ -6060,7 +6102,7 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 		}
 
 		appendStringInfo(indexExprStr,
-						 "%s document %s.bson_%s_composite_path_ops(pathspec=%s%s%s%s%s)",
+						 "%s document %s.bson_%s_composite_path_ops(pathspec=%s%s%s%s%s%s)",
 						 firstColumnWritten ? "," : "",
 						 indexAmOpClassInternalCatalogSchema,
 						 indexAmSuffix,
@@ -6068,7 +6110,8 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 						 indexTermSizeLimitArg,
 						 wildcardIndexString,
 						 wildCardIndexPathLimit,
-						 reducedCorrelatedTermString);
+						 reducedCorrelatedTermString,
+						 collationArg);
 
 		if (indexExprStr->len >= MAX_INDEX_OPTIONS_LENGTH)
 		{
@@ -6165,7 +6208,7 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 					}
 
 					appendStringInfo(indexExprStr,
-									 "%s document %s.bson_%s_single_path_ops(path=%s%s%s%s%s%s%s)",
+									 "%s document %s.bson_%s_single_path_ops(path=%s%s%s%s%s%s)",
 									 firstColumnWritten ? "," : "",
 									 indexAmOpClassCatalogSchema,
 									 indexAmSuffix,
@@ -6174,9 +6217,7 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 									 indexTermSizeLimitArg,
 									 generateNotFoundTermOption,
 									 useReducedWildcardOption,
-									 hasApplicableCollation ? ",collation=" : "",
-									 hasApplicableCollation ?
-									 quote_literal_cstr(collationString) : "");
+									 collationArg);
 
 					if (unique)
 					{
@@ -6932,8 +6973,8 @@ GenerateUniqueProjectionSpec(IndexDefKey *indexDefKey)
 }
 
 
-void
-UpdateIndexStatsForPostgresIndex(uint64 collectionId, List *indexIdList)
+static void
+UpdateUniqueIndexStatsForPostgresIndex(uint64 collectionId, List *indexIdList)
 {
 	StringInfo indexExprStringInfo = makeStringInfo();
 	ListCell *cell;
@@ -7002,5 +7043,18 @@ UpdateIndexStatsForPostgresIndex(uint64 collectionId, List *indexIdList)
 			list_free(columnNumbers);
 			columnNumbers = NIL;
 		}
+	}
+}
+
+
+void
+UpdateIndexStatsForPostgresIndex(uint64 collectionId, List *indexIdList)
+{
+	UpdateUniqueIndexStatsForPostgresIndex(collectionId, indexIdList);
+
+	if (EnablePerCollectionPlannerStatistics &&
+		IsClusterVersionAtleast(DocDB_V0, 111, 0))
+	{
+		UpdateIndexStatisticsForPlannerStatistics(collectionId, indexIdList);
 	}
 }

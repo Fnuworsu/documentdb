@@ -1,10 +1,21 @@
+### documentdb v0.112-0 (Unreleased) ###
+* Eliminate subquery migration in $group for unsharded and sharded with constant _id aggregation queries. Guarded with `EnableGroupSubqueryElimination` *[Perf]*
+* Support collation with non-unique ordered indexes with $lt, $lte. Requires `EnableCollationWithNonUniqueOrderedIndexes` flag to be `on`.  *[Feature]*
+* Support collation with non-unique ordered indexes with $ne. Requires `EnableCollationWithNonUniqueOrderedIndexes` flag to be `on`.  *[Feature]*
+* Fix crash in `BsonOrderFinal` and `BsonOrderFinalOnSorted` when `BSONFIRSTN`/`BSONLASTN` aggregates run on empty sharded collections, caused by a NULL datum not being detected before detoasting. Also fix similar crash in `bson_maxminn_combine` for `BSONMAXN`/`BSONMINN` *[Bugfix]* (#531)
+* Migrate `DrainStreamingQuery` from SPI cursor-based execution to direct executor invocation via `DestReceiver`, eliminating Portal/SPI overhead for streaming queries *[Perf]*
+
 ### documentdb v0.111-0 (Unreleased) ###
 * Add support for `killAllSessions` command *[Feature]* (#526)
+* Support index pushdown for `$group` stage when `_id` is a single-field document expression (e.g., `{ _id: { "field": "$path" } }`) *[Perf]*
+* Add init background job infrastructure for running one time C callback initialization tasks before the periodic job loop. Guarded by `enableBackgroundWorkerInitJobs` feature flag *[Feature]*
+* Add feature flag `enableCollationWithIndexes` to `enableCollationWithNonUniqueOrderedIndexes` to gate collation support specifically for non-unique ordered/composite indexes. Collation is rejected for other index types/options *[Feature]*
 * Fix `$count:{}` accumulator in `$group` to reject invalid arguments. Guarded by `failOnNonEmptyGroupCountArg` feature flag *[Bugfix]*
 * Reject duplicate `_id` in `$group` stage. Guarded by `failOnGroupIdDuplicate` feature flag *[Bugfix]*
 * Update file modification time in `DeserializeFileState` to prevent TTL-based cleanup from expiring actively-used cursor files *[Bugfix]*
 * Improved performance for `$first` and `$last` accumulators in `$group` pipeline stage (no preceding `$sort`) under flag `enableNewWithExprAccumulators`. *[Perf]* (#457)
 * Support `$db` field in wire protocol command specs for insert, update, delete, findAndModify, createIndexes, dropIndexes, collMod, and background index commands *[Feature]*
+* Removed feature flag `documentdb.enableNowSystemVariable` — `$$NOW` time system variable support is now always enabled
 * Fixes crash that occurs when `enableDebugQueryText` is enabled and certain commands (e.g., `count_query`, `find_cursor_first_page`) operate on queries whose query trees are mutated by the PostgreSQL planner. *[Bugfix]* (#484)
 * Map PostgreSQL `Gather Merge` plan node to `PARALLEL_SORT_MERGE` in explain output *[Bugfix]*
 * Fix crash in `BsonTextGenerateTSQueryCore` when `$text` search contains only stop words or empty string, causing `QT2QTN` to read past the end of an empty TSQuery *[Bugfix]*
@@ -13,6 +24,12 @@
 * Enable index only scan by default and move to the cost estimate function *[Feature]*
 * Optimize index boundaries for $regex when there is an anchored prefix *[Perf]*
 * Push $in filters on object_id to the primary key index, during evaluation of a streaming cursor query *[Bugfix]*
+* Improved performance for `$sum` and `$avg` accumulators in `$group` and `$setWindowFields` pipeline stages under flag `enableNewWithExprAccumulators`, with moving window support via inverse transition. (#457)
+* Fix segfault due to use after free in bson_dollar_project_find *[Bugfix]*
+* Remove unnecessary explicit frees of items allocated on tuple-context *[Perf]*
+* Add support for ordering by index term order (matching the ordering spec more closely) for both index and runtime. This also makes index and runtime orders match *[Bugfix]*
+* Support collation with non-unique ordered indexes with $eq, $gt, $gte. Requires `EnableCollationWithNonUniqueOrderedIndexes` flag to be `on`.  *[Feature]*
+* Enable collated index pushdown for collation-insensitive operators; avoid pushdown for unsupported operator strategies. *[Feature]*
 
 
 ### documentdb v0.110-0 (Unreleased) ###
@@ -28,7 +45,7 @@
 * Support for TTL cron job to repeat deletes in batches until the one minute budget is exhausted, instead of deleting one batch per index per minute.*[Perf]*
 * Crash fix when zero rows reach $first/$last/$firstN/$lastN accumulators in $group stage with no $sort *[Bugfix]*. (#466)
 
-### documentdb v0.109-0 (Unreleased) ###
+### documentdb v0.109-0 (March 09, 2026) ###
 * Support collation with find positional queries *[Feature]*
 * Short-circuit in `$cond` runtime evaluation *[Perf]*
 * Support operator variables(eg: $map.as alias) in let variable spec *[Bugfix]*

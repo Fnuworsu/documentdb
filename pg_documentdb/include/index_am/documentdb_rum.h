@@ -88,6 +88,7 @@ void extension_rumcostestimate_core(PlannerInfo *root, IndexPath *path, double
 									double *indexCorrelation,
 									double *indexPages, IndexAmRoutine *coreRoutine,
 									bool forceIndexPushdownCostToZero,
+									bool enableCompositePlannerCosts,
 									OrderedCostEstimateCoreFunc
 									orderedCostEstimateCoreFunc);
 
@@ -111,11 +112,17 @@ bool extension_ruminsert_core(Relation indexRelation,
 bool RumGetTruncationStatus(Relation indexRelation);
 
 struct ExplainState;
+typedef struct pgbson_writer pgbson_writer;
 void ExplainCompositeScan(IndexScanDesc scan, struct ExplainState *es);
+void ExplainCompositeScanToWriter(IndexScanDesc scan, pgbson_writer *writer);
 void ExplainRawCompositeScan(Relation index_rel, List *indexQuals, List *indexOrderBy,
 							 ScanDirection indexScanDir, struct ExplainState *es);
+void ExplainRawCompositeScanToWriter(Relation index_rel, List *indexQuals,
+									 List *indexOrderBy,
+									 ScanDirection indexScanDir, pgbson_writer *writer);
 
 void ExplainRegularIndexScan(IndexScanDesc scan, struct ExplainState *es);
+void ExplainRegularIndexScanToWriter(IndexScanDesc scan, pgbson_writer *writer);
 
 void LogReportedIndexCosts(Oid relOid, struct ExplainState *es);
 void ResetReportedIndexCosts(void);

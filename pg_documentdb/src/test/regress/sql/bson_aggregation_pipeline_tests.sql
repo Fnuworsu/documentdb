@@ -124,6 +124,14 @@ SET documentdb.failOnNonEmptyGroupCountArg TO off;
 SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": "aggregation_pipeline", "pipeline": [ { "$group": { "_id": { "$mod": [ { "$toInt": "$_id" }, 2 ] }, "d": { "$max": "$_id" }, "e": { "$count": 1 } } }], "cursor": {} }');
 SET documentdb.failOnNonEmptyGroupCountArg TO on;
 
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": "aggregation_pipeline", "pipeline": [ { "$group": { "_id": { "$mod": [ { "$toInt": "$_id" }, 2 ] }, "d": { "$max": "$_id" }, "e": { "$count": 1 } } }], "cursor": {} }');
+SET documentdb.enableNewMinMaxAccumulators TO off;
+
+SET documentdb.enableNewWithExprAccumulators TO on;
+SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": "aggregation_pipeline", "pipeline": [ { "$group": { "_id": { "$mod": [ { "$toInt": "$_id" }, 2 ] }, "d": { "$sum": "$_id" }, "e": { "$count": 1 } } }], "cursor": {} }');
+SET documentdb.enableNewWithExprAccumulators TO off;
+
 -- $group with duplicate _id should error
 SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": "aggregation_pipeline", "pipeline": [ { "$group": { "_id": "$int", "_id": "$a" } }], "cursor": {} }');
 
@@ -532,6 +540,23 @@ EXPLAIN (COSTS OFF, VERBOSE ON) SELECT * from documentdb_data.documents_3508 whe
 -- Regression test for NULL pointer check in BSONFIRSTN/BSONLASTN.
 SELECT documentdb_api.create_collection('db', 'bsonFirstNLastNCrashEmptyCollection');
 SELECT BSONLASTNONSORTED(NULL, 3) FROM documentdb_api.collection('db', 'bsonFirstNLastNCrashEmptyCollection');
+
+-- $documents + $group: non-constant _id
+SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ { "category": "A", "val": 10 }, { "category": "B", "val": 20 }, { "category": "A", "val": 30 } ] }, { "$group": { "_id": "$category", "total": { "$sum": "$val" } } } ], "cursor": {}}');
+
+-- $documents + $group: constant _id
+SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ { "val": 10 }, { "val": 20 }, { "val": 30 } ] }, { "$group": { "_id": "all", "total": { "$sum": "$val" }, "cnt": { "$count": {} } } } ], "cursor": {}}');
+
+-- $documents + $group: with $first/$last accumulators
+SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ { "g": 1, "n": "a" }, { "g": 1, "n": "b" }, { "g": 2, "n": "c" } ] }, { "$group": { "_id": "$g", "first": { "$first": "$n" }, "last": { "$last": "$n" } } } ], "cursor": {}}');
+
+-- Toggle test: legacy path with enableGroupSubqueryElimination = off
+SET documentdb.enableGroupSubqueryElimination TO off;
+
+-- Legacy path should still produce correct results
+SELECT document FROM bson_aggregation_pipeline('db', '{ "aggregate": 1, "pipeline": [ { "$documents": [ { "category": "A", "val": 10 }, { "category": "B", "val": 20 }, { "category": "A", "val": 30 } ] }, { "$group": { "_id": "$category", "total": { "$sum": "$val" } } } ], "cursor": {}}');
+
+SET documentdb.enableGroupSubqueryElimination TO on;
 
 RESET documentdb.failOnNonEmptyGroupCountArg;
 RESET documentdb.failOnGroupIdDuplicate;

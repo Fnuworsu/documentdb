@@ -22,6 +22,7 @@
 
 #include "index_am/index_am_exports.h"
 #include "index_am/documentdb_rum.h"
+#include "query/bson_dollar_selectivity.h"
 
 
 PG_MODULE_MAGIC;
@@ -38,7 +39,6 @@ typedef struct DocumentDBRumOidCacheData
 	Oid DocumentDbExtendedRumUniquePathOperatorFamilyId;
 } DocumentDBRumOidCacheData;
 
-extern bool EnableCompositeIndexPlanner;
 
 /* Method Declarations */
 static Oid DocumentDBExtendedRumIndexAmId(void);
@@ -49,8 +49,8 @@ static Oid DocumentDbExtendedRumUniquePathOperatorFamilyOid(void);
 static const char * GetDocumentDBCatalogSchema(void);
 static void LoadBaseIndexAmRoutine(void);
 
-extern PGDLLIMPORT void try_explain_documentdb_rum_index(IndexScanDesc scan, struct
-														 ExplainState *es);
+extern PGDLLIMPORT void try_explain_documentdb_rum_index(IndexScanDesc scan, void *state,
+														 ExplainWriterFuncs *funcs);
 extern PGDLLIMPORT bool can_documentdb_rum_index_scan_ordered(IndexScanDesc scan);
 extern PGDLLIMPORT Datum documentdb_rumhandler(PG_FUNCTION_ARGS);
 extern PGDLLIMPORT bool documentdb_rum_get_multi_key_status(Relation indexRelation);
@@ -322,13 +322,18 @@ extension_documentdb_extended_rumcostestimate(PlannerInfo *root, IndexPath *path
 											  double *indexPages)
 {
 	/* Do not force index cost to zero unless explicitly requested */
-	bool forceIndexCostToZero = !EnableCompositeIndexPlanner;
+	bool enableCompositePlannerCosts = EnablePlannerCostSelectivityFromRelOptInfo(root,
+																				  path->
+																				  indexinfo
+																				  ->rel);
+	bool forceIndexCostToZero = !enableCompositePlannerCosts;
 	OrderedCostEstimateCoreFunc orderedCostEstimateFunc =
 		DocumentDBRumOrderedCostEstimate;
 	extension_rumcostestimate_core(root, path, loop_count, indexStartupCost,
 								   indexTotalCost, indexSelectivity, indexCorrelation,
 								   indexPages, &core_rum_routine,
-								   forceIndexCostToZero, orderedCostEstimateFunc);
+								   forceIndexCostToZero, enableCompositePlannerCosts,
+								   orderedCostEstimateFunc);
 }
 
 

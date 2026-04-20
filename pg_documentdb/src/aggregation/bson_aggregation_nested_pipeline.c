@@ -55,8 +55,6 @@
 
 const int MaximumLookupPipelineDepth = 20;
 extern bool EnableLookupIdJoinOptimizationOnCollation;
-extern bool EnableNowSystemVariable;
-extern bool EnableLookupInnerJoin;
 extern bool EnableOperatorVariablesInLookup;
 extern bool EnableUseForeignKeyLookupInline;
 
@@ -2026,7 +2024,7 @@ OptimizeLookup(LookupArgs *lookupArgs,
 	if (lookupArgs->let)
 	{
 		/* Validate the lookupArgs->let if the left query had no let variables specified in it. */
-		/* With EnableNowSystemVariable, time system variables are stored in the left query's variableSpec even in the absence of let. */
+		/* Time system variables are stored in the left query's variableSpec even in the absence of let. */
 		/* Thus, if the left query's variableSpec contains only the time system variables, */
 		/* we perform a validation on the lookupArgs->let. */
 		if (leftQueryContext->variableSpec == NULL)
@@ -2040,8 +2038,7 @@ OptimizeLookup(LookupArgs *lookupArgs,
 
 			ParseVariableSpec(&varsValue, nullContext, &parseContext);
 		}
-		else if (EnableNowSystemVariable &&
-				 IsA(leftQueryContext->variableSpec, Const))
+		else if (IsA(leftQueryContext->variableSpec, Const))
 		{
 			Node *specNode = (Node *) leftQueryContext->variableSpec;
 			Const *specConst = (Const *) specNode;
@@ -2623,8 +2620,7 @@ ProcessLookupCoreWithLet(Query *query, AggregationPipelineBuildContext *context,
 	MakeBsonJoinVarsFromQuery(rightQueryRteIndex, rightQuery, &outputVars,
 							  &outputColNames, &rightJoinCols);
 
-	bool useInnerJoin = !lookupContext->preserveNullAndEmptyArrays &&
-						EnableLookupInnerJoin;
+	bool useInnerJoin = !lookupContext->preserveNullAndEmptyArrays;
 	RangeTblEntry *joinRte = MakeLookupJoinRte(outputVars, outputColNames, leftJoinCols,
 											   rightJoinCols, useInnerJoin);
 

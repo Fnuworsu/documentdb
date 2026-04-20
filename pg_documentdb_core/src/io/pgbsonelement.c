@@ -33,7 +33,14 @@ extern bool EnableCollation;
 /* --------------------------------------------------------- */
 
 static bool FillPgbsonElementUnsafe(uint8_t *data, uint32_t data_len,
-									pgbsonelement *element, bool skipLengthOffset);
+									pgbsonelement *element);
+static bool FillPgbsonElementUnsafeNoLength(uint8_t *data, uint32_t data_len,
+											pgbsonelement *element);
+
+#if BSON_BYTE_ORDER != BSON_BIG_ENDIAN
+static bool FillBsonElementValueAndPathUnsafe(pgbsonelement *element, uint8_t *data, int
+											  length);
+#endif
 
 /* --------------------------------------------------------- */
 /* pgbsonelement functions */
@@ -184,10 +191,8 @@ BsonValueToPgbsonElementUnsafe(const bson_value_t *bsonValue,
 						errmsg("invalid input BSON: Should be a document")));
 	}
 
-	bool skipLengthOffset = false;
 	if (!FillPgbsonElementUnsafe(bsonValue->value.v_doc.data,
-								 bsonValue->value.v_doc.data_len, element,
-								 skipLengthOffset))
+								 bsonValue->value.v_doc.data_len, element))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 						errmsg("invalid input BSON: Invalid single value document.")));
@@ -199,18 +204,19 @@ void
 BsonDocumentBytesToPgbsonElementUnsafe(const uint8_t *bytes, uint32_t bytesLen,
 									   pgbsonelement *element)
 {
-	bool skipLengthOffset = false;
-	BsonDocumentBytesToPgbsonElementWithOptionsUnsafe(bytes, bytesLen, element,
-													  skipLengthOffset);
+	if (!FillPgbsonElementUnsafe((uint8_t *) bytes, bytesLen, element))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("invalid input BSON: Invalid single value document.")));
+	}
 }
 
 
 void
-BsonDocumentBytesToPgbsonElementWithOptionsUnsafe(const uint8_t *bytes, int32_t bytesLen,
-												  pgbsonelement *element, bool
-												  skipLengthOffset)
+BsonDocumentBytesToPgbsonElementSkipLengthUnsafe(const uint8_t *bytes, int32_t bytesLen,
+												 pgbsonelement *element)
 {
-	if (!FillPgbsonElementUnsafe((uint8_t *) bytes, bytesLen, element, skipLengthOffset))
+	if (!FillPgbsonElementUnsafeNoLength((uint8_t *) bytes, bytesLen, element))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 						errmsg("invalid input BSON: Invalid single value document.")));
@@ -294,8 +300,32 @@ PgbsonElementToPgbson(pgbsonelement *element)
 /* --------------------------------------------------------- */
 
 static bool
-FillPgbsonElementUnsafe(uint8_t *data, uint32_t data_len, pgbsonelement *element, bool
-						skipLengthOffset)
+FillPgbsonElementUnsafeNoLength(uint8_t *data, uint32_t data_len, pgbsonelement *element)
+{
+#if BSON_BYTE_ORDER == BSON_BIG_ENDIAN
+	ereport(ERROR, (errmsg(
+						"No length offset elements not supported on big endian machines")));
+#else
+	uint32_t minLength = 1;
+	Assert(data != NULL);
+
+	if (data_len < minLength)
+	{
+		ereport(ERROR, errmsg("invalid input BSON: Should not be empty document"));
+	}
+
+	/* First byte is the value */
+	element->bsonValue.value_type = (bson_type_t) data[0];
+
+	/* Then the a single \0 and the value */
+	int lengthLeft = data_len - minLength;
+	return FillBsonElementValueAndPathUnsafe(element, &data[minLength + 1], lengthLeft);
+#endif
+}
+
+
+static bool
+FillPgbsonElementUnsafe(uint8_t *data, uint32_t data_len, pgbsonelement *element)
 {
 #if BSON_BYTE_ORDER == BSON_BIG_ENDIAN
 	bson_iter_t iterator;
@@ -318,35 +348,35 @@ FillPgbsonElementUnsafe(uint8_t *data, uint32_t data_len, pgbsonelement *element
 #else
 	uint32_t minLength = 5;
 	uint32_t typeOffset = 4;
-	if (skipLengthOffset)
-	{
-		typeOffset = 0;
-		minLength = 1;
-	}
+	Assert(data != NULL);
 
-	if (data == NULL || data_len < minLength)
+	if (data_len < minLength)
 	{
 		ereport(ERROR, errmsg("invalid input BSON: Should not be empty document"));
 	}
 
 	/* First 4 bytes are the length */
-	uint32_t length = data_len;
-
-	if (!skipLengthOffset)
-	{
-		memcpy(&length, data, sizeof(uint32_t));
-	}
+	uint32_t length;
+	memcpy(&length, data, sizeof(uint32_t));
 
 	/* Fifth byte is the value */
 	element->bsonValue.value_type = (bson_type_t) data[typeOffset];
-	data += minLength;
 
 	/* Then the path that is null terminated */
-	element->path = (char *) data;
+	element->path = (char *) &data[minLength];
 	element->pathLength = strlen(element->path);
-	data += element->pathLength + 1;
+	data += element->pathLength + minLength + 1;
 
-	int lengthLeft = length - element->pathLength - 1 - typeOffset;
+	int lengthLeft = length - element->pathLength - minLength;
+	return FillBsonElementValueAndPathUnsafe(element, data, lengthLeft);
+#endif
+}
+
+
+#if BSON_BYTE_ORDER != BSON_BIG_ENDIAN
+static bool
+FillBsonElementValueAndPathUnsafe(pgbsonelement *element, uint8_t *data, int lengthLeft)
+{
 	switch (element->bsonValue.value_type)
 	{
 		case BSON_TYPE_DATE_TIME:
@@ -389,10 +419,10 @@ FillPgbsonElementUnsafe(uint8_t *data, uint32_t data_len, pgbsonelement *element
 				return false;
 			}
 
-			memcpy(&element->bsonValue.value.v_timestamp.timestamp, data,
+			memcpy(&element->bsonValue.value.v_timestamp.increment, data,
 				   sizeof(uint32_t));
 			data += 4;
-			memcpy(&element->bsonValue.value.v_timestamp.increment, data,
+			memcpy(&element->bsonValue.value.v_timestamp.timestamp, data,
 				   sizeof(uint32_t));
 			return true;
 		}
@@ -570,6 +600,7 @@ FillPgbsonElementUnsafe(uint8_t *data, uint32_t data_len, pgbsonelement *element
 			element->bsonValue.value.v_dbpointer.collection_len = utf8Length - 1;
 
 			/* Next is object id */
+			data += utf8Length;
 			if (lengthLeft < utf8Length + 4 + 12)
 			{
 				return false;
@@ -655,5 +686,7 @@ FillPgbsonElementUnsafe(uint8_t *data, uint32_t data_len, pgbsonelement *element
 			return false;
 		}
 	}
-#endif
 }
+
+
+#endif

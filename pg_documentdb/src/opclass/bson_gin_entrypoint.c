@@ -64,10 +64,14 @@ static Size FillWildcardProjectPathSpec(const char *prefix, void *buffer);
 static bool QueryPathHasDigits(const char *path, uint32_t pathLength);
 static void FailIfQueryPathHasDigitsForWildcard(Datum query, bytea *options);
 
+static bool IsCollationApplicableToStrategy(BsonGinIndexOptionsBase *indexOptions,
+											const char *queryCollation, BsonIndexStrategy
+											strategy, bson_type_t queryValueType);
 
 extern Datum gin_bson_exclusion_pre_consistent(PG_FUNCTION_ARGS);
 extern uint32_t MaxWildcardIndexKeySize;
 extern bool EnableCollation;
+extern bool EnableCollationWithNonUniqueOrderedIndexes;
 
 /*
  * gin_bson_single_path_extract_value is run on the insert/update path and collects the terms
@@ -606,10 +610,10 @@ gin_bson_single_path_options(PG_FUNCTION_ARGS)
 							   "Prefix path for the index",
 							   NULL, &ValidateSinglePathSpec, &FillSinglePathSpec,
 							   offsetof(BsonGinSinglePathOptions, path));
-	add_local_string_reloption(relopts, "collation",
+	add_local_string_reloption(relopts, "cl",
 							   "Collation of the index",
-							   "", &ValidateCollationSpec, &FillCollationSpec,
-							   offsetof(BsonGinSinglePathOptions, collation));
+							   NULL, &ValidateCollationSpec, &FillCollationSpec,
+							   offsetof(BsonGinSinglePathOptions, base.collation));
 	add_local_string_reloption(relopts, "indexname",
 							   "[deprecated] The mongo specific name for the index",
 							   NULL, NULL, &FillDeprecatedStringSpec,
@@ -703,11 +707,12 @@ gin_bson_wildcard_project_options(PG_FUNCTION_ARGS)
 							   &FillWildcardProjectPathSpec,
 							   offsetof(BsonGinWildcardProjectionPathOptions,
 										pathSpec));
-	add_local_string_reloption(relopts, "collation",
+	add_local_string_reloption(relopts, "cl",
 							   "Collation of the index",
-							   "", &ValidateCollationSpec,
+							   NULL, &ValidateCollationSpec,
 							   &FillCollationSpec,
-							   offsetof(BsonGinWildcardProjectionPathOptions, collation));
+							   offsetof(BsonGinWildcardProjectionPathOptions,
+										base.collation));
 	add_local_string_reloption(relopts, "indexname",
 							   "[deprecated] The mongo specific name for the index",
 							   NULL, NULL, &FillDeprecatedStringSpec,
@@ -893,22 +898,17 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 
 	queryBson = DatumGetPgBson(queryValue);
 
-	const char *collationString = PgbsonToSinglePgbsonElementWithCollation(queryBson,
-																		   &filterElement);
+	const char *queryCollation = PgbsonToSinglePgbsonElementWithCollation(queryBson,
+																		  &filterElement);
 
-	if (IsCollationValid(collationString))
-	{
-		/* We don't yet support collated index, until then we can't use index */
-		return false;
-	}
-
-	return ValidateIndexForQualifierElement(indexOptions, &filterElement, strategy);
+	return ValidateIndexForQualifierElement(indexOptions, &filterElement, queryCollation,
+											strategy);
 }
 
 
 bool
 ValidateIndexForQualifierElement(bytea *indexOptions, pgbsonelement *filterElement,
-								 BsonIndexStrategy strategy)
+								 const char *queryCollation, BsonIndexStrategy strategy)
 {
 	BsonGinIndexOptionsBase *options = (BsonGinIndexOptionsBase *) indexOptions;
 
@@ -944,6 +944,12 @@ ValidateIndexForQualifierElement(bytea *indexOptions, pgbsonelement *filterEleme
 
 		case IndexOptionsType_SinglePath:
 		{
+			if (IsCollationValid(queryCollation))
+			{
+				traverse = IndexTraverse_Invalid;
+				break;
+			}
+
 			BsonGinSinglePathOptions *singlePathOptions =
 				(BsonGinSinglePathOptions *) indexOptions;
 
@@ -985,6 +991,13 @@ ValidateIndexForQualifierElement(bytea *indexOptions, pgbsonelement *filterEleme
 
 		case IndexOptionsType_Composite:
 		{
+			if (!IsCollationApplicableToStrategy(options, queryCollation, strategy,
+												 filterElement->bsonValue.value_type))
+			{
+				traverse = IndexTraverse_Invalid;
+				break;
+			}
+
 			int32_t compositeColumnIgnore;
 			traverse = GetCompositePathIndexTraverseOption(
 				strategy, options,
@@ -997,6 +1010,12 @@ ValidateIndexForQualifierElement(bytea *indexOptions, pgbsonelement *filterEleme
 
 		case IndexOptionsType_Hashed:
 		{
+			if (IsCollationValid(queryCollation))
+			{
+				traverse = IndexTraverse_Invalid;
+				break;
+			}
+
 			/* Hash index only supports $eq today */
 			if (strategy != BSON_INDEX_STRATEGY_DOLLAR_EQUAL &&
 				strategy != BSON_INDEX_STRATEGY_DOLLAR_IN)
@@ -1012,6 +1031,12 @@ ValidateIndexForQualifierElement(bytea *indexOptions, pgbsonelement *filterEleme
 
 		case IndexOptionsType_Wildcard:
 		{
+			if (IsCollationValid(queryCollation))
+			{
+				traverse = IndexTraverse_Invalid;
+				break;
+			}
+
 			int32_t pathIndexInnerIgnore = 0;
 			traverse = GetWildcardProjectionPathIndexTraverseOption(options,
 																	filterElement->path,
@@ -1175,6 +1200,9 @@ GetIndexTermMetadata(void *indexOptions)
 		bool allowValueOnly = false;
 		int32_t truncationLimit = options->indexTermTruncateLimit;
 		uint32_t wildcardIndexTruncatedPathLimit = UINT32_MAX;
+		const char *collation = NULL;
+		uint32_t collationStringLength = 0;
+		Get_Index_Collation_Option(options, collation, collation, collationStringLength);
 		if (options->type == IndexOptionsType_SinglePath)
 		{
 			/* For single path indexes, we can elide the index path prefix */
@@ -1236,7 +1264,8 @@ GetIndexTermMetadata(void *indexOptions)
 				   .isWildcard = isWildcard,
 				   .isWildcardProjection = isWildcardProjection,
 				   .indexVersion = options->version,
-				   .allowValueOnly = allowValueOnly
+				   .allowValueOnly = allowValueOnly,
+				   .collation = collation
 		};
 	}
 
@@ -1246,38 +1275,9 @@ GetIndexTermMetadata(void *indexOptions)
 			   .pathPrefix = { 0 },
 			   .isWildcard = false,
 			   .isWildcardProjection = false,
-			   .indexVersion = options->version
+			   .indexVersion = options->version,
+			   .collation = NULL,
 	};
-}
-
-
-void
-GetCollationFromIndexOptions(void *indexOptions, StringView *collationView)
-{
-	BsonGinIndexOptionsBase *options = (BsonGinIndexOptionsBase *) indexOptions;
-	switch (options->type)
-	{
-		case IndexOptionsType_SinglePath:
-		{
-			Get_Index_Collation_Option(((BsonGinSinglePathOptions *) indexOptions),
-									   collation, collationView->string,
-									   collationView->length);
-			break;
-		}
-
-		case IndexOptionsType_Wildcard:
-		{
-			Get_Index_Collation_Option(
-				((BsonGinWildcardProjectionPathOptions *) indexOptions),
-				collation, collationView->string, collationView->length);
-			break;
-		}
-
-		default:
-		{
-			break;
-		}
-	}
 }
 
 
@@ -1620,4 +1620,125 @@ FillWildcardProjectPathSpec(const char *prefix, void *buffer)
 	}
 
 	return totalSize;
+}
+
+
+/*
+ * Checks whether the query collation matches the index collation.
+ * Returns true when both are absent or when the ICU locale strings
+ * are identical. Returns false on any mismatch.
+ */
+static bool
+IsCollationApplicableToStrategy(BsonGinIndexOptionsBase *indexOptions,
+								const char *queryCollation, BsonIndexStrategy strategy,
+								bson_type_t queryValueType)
+{
+	uint32_t indexCollationLength = 0;
+	const char *indexCollation = NULL;
+	Get_Index_Collation_Option(indexOptions, collation, indexCollation,
+							   indexCollationLength);
+
+	bool indexHasCollation = IsCollationValid(indexCollation);
+	bool queryHasCollation = IsCollationValid(queryCollation);
+
+	if (!EnableCollationWithNonUniqueOrderedIndexes)
+	{
+		/* Reject if either query or index has collation */
+		return !queryHasCollation && !indexHasCollation;
+	}
+
+	/* If neither has collation, all strategies are applicable */
+	if (!indexHasCollation && !queryHasCollation)
+	{
+		return true;
+	}
+
+	/*
+	 * Check whether the strategy can use this collated index.
+	 */
+	bool collationsMatch = (indexHasCollation == queryHasCollation) &&
+						   (!indexHasCollation ||
+							strcmp(indexCollation, queryCollation) == 0);
+
+	switch (strategy)
+	{
+		/*
+		 * Collation-insensitive operators — safe to push down regardless
+		 * of whether collations match.
+		 */
+		case BSON_INDEX_STRATEGY_DOLLAR_EXISTS:
+		case BSON_INDEX_STRATEGY_DOLLAR_SIZE:
+		case BSON_INDEX_STRATEGY_DOLLAR_TYPE:
+		case BSON_INDEX_STRATEGY_DOLLAR_BITS_ALL_CLEAR:
+		case BSON_INDEX_STRATEGY_DOLLAR_BITS_ANY_CLEAR:
+		case BSON_INDEX_STRATEGY_DOLLAR_BITS_ALL_SET:
+		case BSON_INDEX_STRATEGY_DOLLAR_BITS_ANY_SET:
+		case BSON_INDEX_STRATEGY_DOLLAR_MOD:
+		{
+			return true;
+		}
+
+		/* Collation-sensitive comparison operators */
+		case BSON_INDEX_STRATEGY_DOLLAR_EQUAL:
+		case BSON_INDEX_STRATEGY_DOLLAR_NOT_EQUAL:
+		case BSON_INDEX_STRATEGY_DOLLAR_GREATER:
+		case BSON_INDEX_STRATEGY_DOLLAR_GREATER_EQUAL:
+		case BSON_INDEX_STRATEGY_DOLLAR_LESS:
+		case BSON_INDEX_STRATEGY_DOLLAR_LESS_EQUAL:
+		{
+			if (!IsBsonTypeCollationAware(queryValueType))
+			{
+				return true;
+			}
+
+			return collationsMatch;
+		}
+
+		/*
+		 * $regex is not collation-aware.
+		 * TODO (COLLATION): Consider creating bounds (eg: [>= "", < MaxString]).
+		 */
+		case BSON_INDEX_STRATEGY_DOLLAR_REGEX:
+		{
+			return false;
+		}
+
+		/* Geo operators — not supported */
+		case BSON_INDEX_STRATEGY_DOLLAR_GEOWITHIN:
+		case BSON_INDEX_STRATEGY_DOLLAR_GEOINTERSECTS:
+		case BSON_INDEX_STRATEGY_GEONEAR:
+		case BSON_INDEX_STRATEGY_GEONEAR_RANGE:
+		{
+			return false;
+		}
+
+		/* TODO (COLLATION): To be supported */
+		case BSON_INDEX_STRATEGY_DOLLAR_IN:
+		case BSON_INDEX_STRATEGY_DOLLAR_NOT_IN:
+		case BSON_INDEX_STRATEGY_DOLLAR_NOT_GT:
+		case BSON_INDEX_STRATEGY_DOLLAR_NOT_GTE:
+		case BSON_INDEX_STRATEGY_DOLLAR_NOT_LT:
+		case BSON_INDEX_STRATEGY_DOLLAR_NOT_LTE:
+		case BSON_INDEX_STRATEGY_DOLLAR_ELEMMATCH:
+		case BSON_INDEX_STRATEGY_DOLLAR_RANGE:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_INDEXTERM:
+
+		/* TODO (COLLATION): Pending unique index support */
+		case BSON_INDEX_STRATEGY_UNIQUE_EQUAL:
+
+		/* Not applicable */
+		case BSON_INDEX_STRATEGY_DOLLAR_ALL:
+		case BSON_INDEX_STRATEGY_DOLLAR_TEXT:
+		case BSON_INDEX_STRATEGY_COMPOSITE_QUERY:
+		case BSON_INDEX_STRATEGY_IS_MULTIKEY:
+		case BSON_INDEX_STRATEGY_HAS_TRUNCATED_TERMS:
+		case BSON_INDEX_STRATEGY_HAS_CORRELATED_REDUCED_TERMS:
+		case BSON_INDEX_STRATEGY_INVALID:
+		default:
+		{
+			return false;
+		}
+	}
 }

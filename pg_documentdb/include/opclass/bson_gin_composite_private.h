@@ -155,6 +155,7 @@ typedef struct CompositeQueryMetaInfo
 	int32_t wildcardPathIndex;
 	CompositeOrderedScanEntryData *orderedScanEntryData;
 	bool isOrderedScan;
+	const char *collation;
 } CompositeQueryMetaInfo;
 
 typedef struct CompositeQueryRunData
@@ -178,7 +179,8 @@ CreateCompositeIndexBoundsSet(int32_t numTerms, int32_t indexAttribute,
 
 
 bool IsValidRecheckForIndexValue(const BsonIndexTerm *compareTerm,
-								 IndexRecheckArgs *recheckArgs);
+								 IndexRecheckArgs *recheckArgs,
+								 const char *indexCollation);
 
 bytea * BuildLowerBoundTermFromIndexBounds(CompositeQueryRunData *runData,
 										   IndexTermCreateMetadata *metadata,
@@ -213,7 +215,8 @@ bool TryUpdateBoundsForTruncation(CompositeQueryRunData *runData,
 								  int8_t *sortOrders);
 
 List * MergeSingleVariableBounds(List *variableBounds, const char **wildcardPath,
-								 CompositeIndexBounds *mergedBounds);
+								 CompositeIndexBounds *mergedBounds,
+								 const char *indexCollation);
 List * MergeWildCardSingleVariableBounds(List *variableBounds);
 
 void TrimSecondaryVariableBounds(VariableIndexBounds *variableBounds,

@@ -93,6 +93,7 @@ typedef struct CompareMetadata
 {
 	bool isBackwardScan;
 	bool isWildcardScan;
+	const char *collation;
 } CompareMetadata;
 
 
@@ -132,6 +133,7 @@ extern bool EnableCompositeWildcardSkipEmptyEntries;
 extern int MaxNonOrderedTermScanThreshold;
 extern bool EnableOrderedCompositeOperatorScan;
 extern bool EnableBinarySearchForOrderedMove;
+extern bool EnableComparableTerms;
 
 static void ValidateCompositePathSpec(const char *prefix);
 static Size FillCompositePathSpec(const char *prefix, void *buffer);
@@ -163,12 +165,13 @@ static void ParseCompositeQuerySpec(pgbson *querySpec, pgbsonelement *singleElem
 									bool *hasCorrelatedReducedTerms,
 									bool *isBackward, bool *supportsOrderedOperatorScans);
 static int32_t RunCompareOnBounds(CompositeIndexBounds *bounds,
-								  const BsonIndexTerm *compareValue,
+								  SerializedCompositeTermPair *termPair,
 								  bool hasEqualityPrefix, bool isBackwardScan,
 								  bool isWildcardMatch, bool allowSkipScanBoundaries,
-								  bool *priorMatchesEquality, bool *hasUnspecifiedPrefix);
+								  bool *priorMatchesEquality, bool *hasUnspecifiedPrefix,
+								  const char *collation);
 static int AdvanceOrderedScanData(CompositeQueryRunData *runData,
-								  const BsonIndexTerm *currentTermsSet,
+								  SerializedCompositeTermPair *serializedTermsSet,
 								  int compareIndex, bool *hasNoScalarArrayBounds);
 static void OptimizeVariableBoundsForQuery(CompositeQueryRunData *runData,
 										   VariableIndexBounds *variableBounds,
@@ -179,8 +182,7 @@ static void OptimizeVariableBoundsForOrderedScans(CompositeQueryRunData *runData
 												  VariableIndexBounds *variableBounds,
 												  bool hasArrayPaths);
 static int RunCompareOnOrderedIndexSet(CompositeQueryRunData *runData,
-									   bytea *serializedTerms[INDEX_MAX_KEYS],
-									   BsonIndexTerm currentTermsSet[INDEX_MAX_KEYS]);
+									   SerializedCompositeTermPair *serializedTermsSet);
 static Datum * GenerateCompositeExtractQueryUniqueEqual(pgbson *bson,
 														BsonGinCompositePathOptions *
 														options,
@@ -218,8 +220,7 @@ static Datum * ProcessOrderedCompositeQueryEntries(int32_t totalPathTerms,
 												   bool isOrderedScan,
 												   int32_t *searchMode);
 static int RunCompareOnStandardIndexSet(CompositeQueryRunData *runData,
-										bytea **serializedTerms,
-										BsonIndexTerm *currentTermsSet);
+										SerializedCompositeTermPair *serializedTermsSet);
 
 inline static IndexTermCreateMetadata
 GetSinglePathTermCreateMetadata(void *options, int32_t numPaths)
@@ -363,6 +364,14 @@ gin_bson_composite_path_extract_query(PG_FUNCTION_ARGS)
 	CompositeQueryRunData *runData = CreateCompositeQueryRunData(numPaths);
 	runData->metaInfo = metaInfo;
 	metaInfo->numIndexPaths = numPaths;
+
+	/* Populate collation from index options */
+	const char *indexCollation = NULL;
+	int indexCollationLength = 0;
+	Get_Index_Collation_Option((&options->base), collation,
+							   indexCollation, indexCollationLength);
+	metaInfo->collation = indexCollation;
+
 	metaInfo->wildcardPathIndex = EnableCompositeWildcardIndex ?
 								  options->wildcardPathIndex : -1;
 
@@ -509,6 +518,17 @@ gin_bson_composite_path_extract_query(PG_FUNCTION_ARGS)
 	}
 	else
 	{
+		if (supportsOrderedOperatorScans &&
+			totalPathTerms >= 100)
+		{
+			ReportFeatureUsage(FEATURE_QUERY_ORDERED_SAOP_100_TERMS);
+		}
+		else if (supportsOrderedOperatorScans &&
+				 totalPathTerms >= 50)
+		{
+			ReportFeatureUsage(FEATURE_QUERY_ORDERED_SAOP_50_TERMS);
+		}
+
 		entries = ProcessStandardCompositeQueryEntries(totalPathTerms,
 													   &singlePathMetadata,
 													   &compositeMetadata,
@@ -850,7 +870,8 @@ OptimizeVariableBoundsForQuery(CompositeQueryRunData *runData,
 			variableBounds->variableBoundsList =
 				MergeSingleVariableBounds(variableBounds->variableBoundsList,
 										  &runData->wildcardPath,
-										  runData->indexBounds);
+										  runData->indexBounds,
+										  runData->metaInfo->collation);
 		}
 	}
 
@@ -883,22 +904,21 @@ gin_bson_composite_path_compare_partial(PG_FUNCTION_ARGS)
 	Pointer extraData = PG_GETARG_POINTER(3);
 
 	CompositeQueryRunData *runData = (CompositeQueryRunData *) extraData;
-	bytea *serializedTerms[INDEX_MAX_KEYS] = { 0 };
-	int32_t numTerms = InitializeSerializedCompositeIndexTerm(compareValue,
-															  serializedTerms);
+	SerializedCompositeTermPair serializedTerms[INDEX_MAX_KEYS] = { 0 };
+	int32_t numTerms = LazyInitializeSerializedCompositeIndexTerm(compareValue,
+																  serializedTerms);
 	switch (strategy)
 	{
 		case BSON_INDEX_STRATEGY_IS_MULTIKEY:
 		{
-			if (!IsSerializedIndexTermMetadata(serializedTerms[0]))
+			if (!IsSerializedIndexTermMetadata(serializedTerms[0].serializedTerm))
 			{
 				PG_RETURN_INT32(1);
 			}
 
-			BsonIndexTerm term;
-			InitializeBsonIndexTerm(serializedTerms[0], &term);
+			InitializeBsonIndexTermIfNeeded(&serializedTerms[0]);
 
-			if (term.element.bsonValue.value_type == BSON_TYPE_ARRAY)
+			if (serializedTerms[0].term.element.bsonValue.value_type == BSON_TYPE_ARRAY)
 			{
 				PG_RETURN_INT32(0);
 			}
@@ -908,17 +928,16 @@ gin_bson_composite_path_compare_partial(PG_FUNCTION_ARGS)
 
 		case BSON_INDEX_STRATEGY_HAS_CORRELATED_REDUCED_TERMS:
 		{
-			if (!IsSerializedIndexTermMetadata(serializedTerms[0]))
+			if (!IsSerializedIndexTermMetadata(serializedTerms[0].serializedTerm))
 			{
 				PG_RETURN_INT32(1);
 			}
 
-			BsonIndexTerm term;
-			InitializeBsonIndexTerm(serializedTerms[0], &term);
+			InitializeBsonIndexTermIfNeeded(&serializedTerms[0]);
 
-			if (term.element.bsonValue.value_type == BSON_TYPE_INT32)
+			if (serializedTerms[0].term.element.bsonValue.value_type == BSON_TYPE_INT32)
 			{
-				if (term.element.bsonValue.value.v_int32 ==
+				if (serializedTerms[0].term.element.bsonValue.value.v_int32 ==
 					RootMetadataKind_CorrelatedRootArray)
 				{
 					PG_RETURN_INT32(0);
@@ -930,14 +949,13 @@ gin_bson_composite_path_compare_partial(PG_FUNCTION_ARGS)
 
 		case BSON_INDEX_STRATEGY_HAS_TRUNCATED_TERMS:
 		{
-			if (IsSerializedRootTruncationTerm(serializedTerms[0]))
+			if (IsSerializedRootTruncationTerm(serializedTerms[0].serializedTerm))
 			{
 				PG_RETURN_INT32(0);
 			}
 
-			BsonIndexTerm term;
-			InitializeBsonIndexTerm(serializedTerms[0], &term);
-			if (term.element.pathLength != 0)
+			InitializeBsonIndexTermIfNeeded(&serializedTerms[0]);
+			if (serializedTerms[0].term.element.pathLength != 0)
 			{
 				PG_RETURN_INT32(1);
 			}
@@ -947,12 +965,13 @@ gin_bson_composite_path_compare_partial(PG_FUNCTION_ARGS)
 
 		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY:
 		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_INDEXTERM:
 		case BSON_INDEX_STRATEGY_INVALID:
 		{
 			/* use order by key to signal truncation status of ordering */
 			for (int i = 0; i < numTerms; i++)
 			{
-				if (IsSerializedIndexTermTruncated(serializedTerms[i]))
+				if (IsSerializedIndexTermTruncated(serializedTerms[i].serializedTerm))
 				{
 					PG_RETURN_INT32(-1);
 				}
@@ -976,8 +995,8 @@ gin_bson_composite_path_compare_partial(PG_FUNCTION_ARGS)
 	}
 
 	if (runData->metaInfo->isBackwardScan && numTerms == 1 &&
-		(IsSerializedIndexTermMetadata(serializedTerms[0]) ||
-		 IsSerializedRootTruncationTerm(serializedTerms[0])))
+		(IsSerializedIndexTermMetadata(serializedTerms[0].serializedTerm) ||
+		 IsSerializedRootTruncationTerm(serializedTerms[0].serializedTerm)))
 	{
 		/* Stop the scan if we hit a metadata term */
 		PG_RETURN_INT32(1);
@@ -991,12 +1010,10 @@ gin_bson_composite_path_compare_partial(PG_FUNCTION_ARGS)
 							   numTerms, runData->metaInfo->numIndexPaths)));
 	}
 
-	BsonIndexTerm currentTermsSet[INDEX_MAX_KEYS] = { 0 };
 	int compareResult;
 	if (runData->metaInfo->orderedScanEntryData == NULL)
 	{
-		compareResult = RunCompareOnStandardIndexSet(runData, serializedTerms,
-													 currentTermsSet);
+		compareResult = RunCompareOnStandardIndexSet(runData, serializedTerms);
 	}
 	else
 	{
@@ -1004,8 +1021,7 @@ gin_bson_composite_path_compare_partial(PG_FUNCTION_ARGS)
 		 * If not, we need to advance the scan keys until we find a key that satisfies the bounds
 		 * or we exhaust the keys.
 		 */
-		compareResult = RunCompareOnOrderedIndexSet(runData, serializedTerms,
-													currentTermsSet);
+		compareResult = RunCompareOnOrderedIndexSet(runData, serializedTerms);
 	}
 
 	PG_FREE_IF_COPY(compareValue, 1);
@@ -1015,8 +1031,7 @@ gin_bson_composite_path_compare_partial(PG_FUNCTION_ARGS)
 
 static int
 RunCompareOnPathIndex(CompositeQueryRunData *runData,
-					  bytea *serializedTerms[INDEX_MAX_KEYS],
-					  BsonIndexTerm currentTermsSet[INDEX_MAX_KEYS],
+					  SerializedCompositeTermPair serializedTerms[INDEX_MAX_KEYS],
 					  bool allowSkipScanBoundaries,
 					  bool *priorMatchesEquality, bool *hasUnspecifiedPrefix,
 					  bool *hasEqualityPrefix, int compareIndex)
@@ -1031,15 +1046,14 @@ RunCompareOnPathIndex(CompositeQueryRunData *runData,
 		return 0;
 	}
 
-	InitializeBsonIndexTerm(serializedTerms[compareIndex],
-							&currentTermsSet[compareIndex]);
 	*hasEqualityPrefix = *hasEqualityPrefix && *priorMatchesEquality;
 	int32_t compareInBounds = RunCompareOnBounds(
 		&runData->indexBounds[compareIndex],
-		&currentTermsSet[compareIndex],
+		&serializedTerms[compareIndex],
 		*hasEqualityPrefix,
 		runData->metaInfo->isBackwardScan, runData->wildcardPath != NULL,
-		allowSkipScanBoundaries, priorMatchesEquality, hasUnspecifiedPrefix);
+		allowSkipScanBoundaries, priorMatchesEquality, hasUnspecifiedPrefix,
+		runData->metaInfo->collation);
 	if (compareInBounds != 0)
 	{
 		return compareInBounds;
@@ -1047,13 +1061,15 @@ RunCompareOnPathIndex(CompositeQueryRunData *runData,
 
 	if (runData->indexBounds[compareIndex].indexRecheckFunctions != NIL)
 	{
+		InitializeBsonIndexTermIfNeeded(&serializedTerms[compareIndex]);
 		ListCell *recheckFuncs;
 		foreach(recheckFuncs,
 				runData->indexBounds[compareIndex].indexRecheckFunctions)
 		{
 			IndexRecheckArgs *recheckStrategy = lfirst(recheckFuncs);
-			if (!IsValidRecheckForIndexValue(&currentTermsSet[compareIndex],
-											 recheckStrategy))
+			if (!IsValidRecheckForIndexValue(&serializedTerms[compareIndex].term,
+											 recheckStrategy,
+											 runData->metaInfo->collation))
 			{
 				return -1;
 			}
@@ -1066,8 +1082,7 @@ RunCompareOnPathIndex(CompositeQueryRunData *runData,
 
 static int
 RunCompareOnStandardIndexSet(CompositeQueryRunData *runData,
-							 bytea **serializedTerms,
-							 BsonIndexTerm *currentTermsSet)
+							 SerializedCompositeTermPair *serializedTerms)
 {
 	bool priorMatchesEquality = true;
 	bool hasEqualityPrefix = true;
@@ -1076,7 +1091,7 @@ RunCompareOnStandardIndexSet(CompositeQueryRunData *runData,
 		 compareIndex++)
 	{
 		bool hasUnspecifiedPrefix = false;
-		int cmp = RunCompareOnPathIndex(runData, serializedTerms, currentTermsSet,
+		int cmp = RunCompareOnPathIndex(runData, serializedTerms,
 										allowSkipScanBoundaries, &priorMatchesEquality,
 										&hasUnspecifiedPrefix, &hasEqualityPrefix,
 										compareIndex);
@@ -1140,17 +1155,11 @@ ResetUnsatisfiableBounds(CompositeQueryRunData *runData, int compareIndex)
 
 static void
 PinEqualityBoundForRange(CompositeQueryRunData *runData,
-						 BsonIndexTerm currentTermsSet[INDEX_MAX_KEYS],
-						 bytea *serializedTerms[INDEX_MAX_KEYS],
+						 SerializedCompositeTermPair *serializedTerms,
 						 int compareIndex)
 {
 	CompositeOrderedScanEntryData *entryData = runData->metaInfo->orderedScanEntryData;
-	if (currentTermsSet[compareIndex].element.bsonValue.value_type == BSON_TYPE_EOD)
-	{
-		/* Initialize if needed */
-		InitializeBsonIndexTerm(serializedTerms[compareIndex],
-								&currentTermsSet[compareIndex]);
-	}
+	InitializeBsonIndexTermIfNeeded(&serializedTerms[compareIndex]);
 
 	CompositePerPathEntries *entries = &entryData->perPathEntries[compareIndex];
 	if (entries->currentPathEqualityTerm != NULL)
@@ -1162,7 +1171,7 @@ PinEqualityBoundForRange(CompositeQueryRunData *runData,
 		bool isCompareisonValid = false;
 		const char *collationString = NULL;
 		if (CompareBsonIndexTerm(&entries->currentPathEqualityTermValue,
-								 &currentTermsSet[compareIndex],
+								 &serializedTerms[compareIndex].term,
 								 &isCompareisonValid, collationString) == 0)
 		{
 			return;
@@ -1175,9 +1184,11 @@ PinEqualityBoundForRange(CompositeQueryRunData *runData,
 	}
 
 	MemoryContext oldContext = MemoryContextSwitchTo(entryData->scanKeyMemoryContext);
-	entries->currentPathEqualityTerm = palloc(VARSIZE_ANY(serializedTerms[compareIndex]));
-	memcpy(entries->currentPathEqualityTerm, serializedTerms[compareIndex],
-		   VARSIZE_ANY(serializedTerms[compareIndex]));
+	entries->currentPathEqualityTerm = palloc(VARSIZE_ANY(
+												  serializedTerms[compareIndex].
+												  serializedTerm));
+	memcpy(entries->currentPathEqualityTerm, serializedTerms[compareIndex].serializedTerm,
+		   VARSIZE_ANY(serializedTerms[compareIndex].serializedTerm));
 	MemoryContextSwitchTo(oldContext);
 
 	entries->baseRangeBounds = runData->indexBounds[compareIndex];
@@ -1241,8 +1252,7 @@ PinEqualityBoundForRange(CompositeQueryRunData *runData,
  */
 static int
 RunCompareOnOrderedIndexSet(CompositeQueryRunData *runData,
-							bytea *serializedTerms[INDEX_MAX_KEYS],
-							BsonIndexTerm currentTermsSet[INDEX_MAX_KEYS])
+							SerializedCompositeTermPair *serializedTerms)
 {
 	bool hasUnspecifiedPrefix = false;
 	bool hasSkipScanBoundary = false;
@@ -1256,7 +1266,7 @@ RunCompareOnOrderedIndexSet(CompositeQueryRunData *runData,
 		bool hasOrderedEqualityPrefix = true;
 		bool priorMatchesEquality = true;
 		bool allowSkipScanBoundaries = true;
-		compareResult = RunCompareOnPathIndex(runData, serializedTerms, currentTermsSet,
+		compareResult = RunCompareOnPathIndex(runData, serializedTerms,
 											  allowSkipScanBoundaries,
 											  &priorMatchesEquality,
 											  &hasUnspecifiedPrefix,
@@ -1268,7 +1278,7 @@ RunCompareOnOrderedIndexSet(CompositeQueryRunData *runData,
 			/* We exhausted everything for the current bounds this path.
 			 * Try to advance this path forward to its next bounds */
 			bool hasNoScalarArrayBounds = false;
-			int advanceResult = AdvanceOrderedScanData(runData, currentTermsSet,
+			int advanceResult = AdvanceOrderedScanData(runData, serializedTerms,
 													   compareIndex,
 													   &hasNoScalarArrayBounds);
 			if (advanceResult == 1)
@@ -1306,7 +1316,7 @@ RunCompareOnOrderedIndexSet(CompositeQueryRunData *runData,
 				 * the scan moves forward/backward, it will reset the bounds to just this.
 				 * (i.e., pin the indexBounds to be an equality bound of the form [x,x])
 				 */
-				PinEqualityBoundForRange(runData, currentTermsSet, serializedTerms,
+				PinEqualityBoundForRange(runData, serializedTerms,
 										 compareIndex);
 			}
 
@@ -1467,7 +1477,7 @@ static int
 CompareOnBoundsForSearch(const void *a, const void *b, void *arg)
 {
 	CompositeIndexBounds *bound = (CompositeIndexBounds *) a;
-	BsonIndexTerm *term = (BsonIndexTerm *) b;
+	SerializedCompositeTermPair *termPair = (SerializedCompositeTermPair *) b;
 	CompareMetadata *metadata = (CompareMetadata *) arg;
 
 	bool allowSkipScansOnBoundary = true;
@@ -1475,11 +1485,12 @@ CompareOnBoundsForSearch(const void *a, const void *b, void *arg)
 	bool priorMatchesEquality = true;
 	bool hasUnspecifiedPrefix = false;
 	int compareResult = RunCompareOnBounds(
-		bound, term, isEqualityPrefix,
+		bound, termPair, isEqualityPrefix,
 		metadata->isBackwardScan,
 		metadata->isWildcardScan,
 		allowSkipScansOnBoundary, &priorMatchesEquality,
-		&hasUnspecifiedPrefix);
+		&hasUnspecifiedPrefix,
+		metadata->collation);
 
 	return compareResult == 0 ? 0 : (compareResult < 0 ? 1 : -1);
 }
@@ -1487,7 +1498,7 @@ CompareOnBoundsForSearch(const void *a, const void *b, void *arg)
 
 static int
 AdvanceOrderedScanData(CompositeQueryRunData *runData,
-					   const BsonIndexTerm *currentTermsSet,
+					   SerializedCompositeTermPair *serializedTermsSet,
 					   int compareIndex,
 					   bool *hasNoScalarArrayBounds)
 {
@@ -1539,10 +1550,11 @@ advance_ordered_scan_data_start:
 
 		int compareResult = RunCompareOnBounds(
 			&entry->boundsSet->bounds[entry->currentOperatorIndex],
-			&currentTermsSet[compareIndex], isEqualityPrefixOrdered,
+			&serializedTermsSet[compareIndex], isEqualityPrefixOrdered,
 			runData->metaInfo->isBackwardScan,
 			entry->boundsSet->wildcardPath != NULL, allowSkipScansOnBoundary,
-			&priorMatchesEquality, &hasUnspecifiedPrefix);
+			&priorMatchesEquality, &hasUnspecifiedPrefix,
+			runData->metaInfo->collation);
 		if (compareResult == 1)
 		{
 			/* This particular bound is exhausted - move to the next one
@@ -1552,13 +1564,14 @@ advance_ordered_scan_data_start:
 			{
 				CompareMetadata searchMetadata = {
 					.isBackwardScan = runData->metaInfo->isBackwardScan,
-					.isWildcardScan = entry->boundsSet->wildcardPath != NULL
+					.isWildcardScan = entry->boundsSet->wildcardPath != NULL,
+					.collation = runData->metaInfo->collation
 				};
 				int foundIndex = BinarySearchBoundsArray(
 					entry->boundsSet->bounds, entry->currentOperatorIndex + 1,
 					entry->boundsSet->numBounds, sizeof(CompositeIndexBounds),
-					&currentTermsSet[compareIndex],
-					CompareOnBoundsForSearch, &searchMetadata);
+					&serializedTermsSet[compareIndex], CompareOnBoundsForSearch,
+					&searchMetadata);
 				if (foundIndex >= 0)
 				{
 					entry->currentOperatorIndex = foundIndex;
@@ -1637,11 +1650,11 @@ advance_ordered_scan_data_start:
 
 
 inline static int
-SetBoundaryStoppingValueLessThan(bool hasEqualityPrefix, const BsonIndexTerm *compareTerm,
+SetBoundaryStoppingValueLessThan(bool hasEqualityPrefix, bytea *serializedTerm,
 								 bool isBackwardScan, bool allowSkipScanBoundaries)
 {
 	int cmp;
-	if (!IsIndexTermValueDescending(compareTerm))
+	if (!IsSerializedTermValueDescending(serializedTerm))
 	{
 		cmp = (allowSkipScanBoundaries && !isBackwardScan) ? -3 : -1;
 	}
@@ -1665,12 +1678,12 @@ SetBoundaryStoppingValueLessThan(bool hasEqualityPrefix, const BsonIndexTerm *co
 
 
 inline static int
-SetBoundaryStoppingValueGreaterThan(bool hasEqualityPrefix, const
-									BsonIndexTerm *compareTerm, bool isBackwardScan,
+SetBoundaryStoppingValueGreaterThan(bool hasEqualityPrefix, bytea *serializedterm, bool
+									isBackwardScan,
 									bool allowSkipScanBoundaries)
 {
 	int cmp;
-	if (IsIndexTermValueDescending(compareTerm))
+	if (IsSerializedTermValueDescending(serializedterm))
 	{
 		cmp = (allowSkipScanBoundaries && !isBackwardScan) ? -3 : -1;
 	}
@@ -1701,33 +1714,46 @@ SetBoundaryStoppingValueGreaterThan(bool hasEqualityPrefix, const
  * Index rechecks.
  */
 static int32_t
-RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTerm,
+RunCompareOnBounds(CompositeIndexBounds *bounds, SerializedCompositeTermPair *termPair,
 				   bool hasEqualityPrefix, bool isBackwardScan, bool isWildCardMatch,
 				   bool allowSkipScanBoundaries, bool *priorMatchesEquality,
-				   bool *hasUnspecifiedPrefix)
+				   bool *hasUnspecifiedPrefix, const char *collation)
 {
 	if (bounds->isEqualityBound)
 	{
 		/* We have an equality on a term - if not equal - we can bail */
 		bool isComparisonValid = false;
-		int32_t compareBounds = CompareBsonValueAndType(
-			&compareTerm->element.bsonValue,
-			&bounds->lowerBound.indexTermValue.element.bsonValue,
-			&isComparisonValid);
+		int32_t compareBounds;
+		if (EnableComparableTerms && !isWildCardMatch)
+		{
+			compareBounds = CompareSerializedBsonIndexTerms(
+				termPair->serializedTerm, bounds->lowerBound.serializedTerm,
+				collation, &isComparisonValid);
+		}
+		else
+		{
+			InitializeBsonIndexTermIfNeeded(termPair);
+			compareBounds = CompareBsonValueAndTypeWithCollation(
+				&termPair->term.element.bsonValue,
+				&bounds->lowerBound.indexTermValue.element.bsonValue,
+				&isComparisonValid, collation);
+		}
 
 		/* If we're an equality and we're less than the lower bound, this
 		 * is an order by situation, and we need to keep searching.
 		 */
 		if (compareBounds < 0)
 		{
-			return SetBoundaryStoppingValueLessThan(hasEqualityPrefix, compareTerm,
+			return SetBoundaryStoppingValueLessThan(hasEqualityPrefix,
+													termPair->serializedTerm,
 													isBackwardScan,
 													allowSkipScanBoundaries);
 		}
 		else if (compareBounds > 0)
 		{
 			/* Stop the search if ascending */
-			return SetBoundaryStoppingValueGreaterThan(hasEqualityPrefix, compareTerm,
+			return SetBoundaryStoppingValueGreaterThan(hasEqualityPrefix,
+													   termPair->serializedTerm,
 													   isBackwardScan,
 													   allowSkipScanBoundaries);
 		}
@@ -1735,9 +1761,10 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 		if (isWildCardMatch)
 		{
 			/* For equality scenarios, ensure that the paths match too */
-			return strcmp(compareTerm->element.path,
+			InitializeBsonIndexTermIfNeeded(termPair);
+			return strcmp(termPair->term.element.path,
 						  bounds->lowerBound.indexTermValue.element.path) == 0 &&
-				   compareTerm->element.pathLength ==
+				   termPair->term.element.pathLength ==
 				   bounds->lowerBound.indexTermValue.element.pathLength;
 		}
 
@@ -1748,10 +1775,22 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 	if (bounds->lowerBound.bound.value_type != BSON_TYPE_EOD)
 	{
 		bool isComparisonValid = false;
-		int32_t compareBounds = CompareBsonValueAndType(
-			&compareTerm->element.bsonValue,
-			&bounds->lowerBound.indexTermValue.element.bsonValue,
-			&isComparisonValid);
+		int32_t compareBounds;
+		if (EnableComparableTerms && !isWildCardMatch)
+		{
+			compareBounds = CompareSerializedBsonIndexTerms(
+				termPair->serializedTerm, bounds->lowerBound.serializedTerm,
+				collation, &isComparisonValid);
+		}
+		else
+		{
+			InitializeBsonIndexTermIfNeeded(termPair);
+			compareBounds = CompareBsonValueAndTypeWithCollation(
+				&termPair->term.element.bsonValue,
+				&bounds->lowerBound.indexTermValue.element.bsonValue,
+				&isComparisonValid, collation);
+		}
+
 		if (!isComparisonValid)
 		{
 			return -1;
@@ -1770,7 +1809,8 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 			/* compareValue < lowerBound, not a match: if descending
 			 * then less than minimum means we can stop.
 			 */
-			return SetBoundaryStoppingValueLessThan(hasEqualityPrefix, compareTerm,
+			return SetBoundaryStoppingValueLessThan(hasEqualityPrefix,
+													termPair->serializedTerm,
 													isBackwardScan,
 													allowSkipScanBoundaries);
 		}
@@ -1779,13 +1819,14 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 		if (isWildCardMatch)
 		{
 			bool isPathMatch = false;
+			InitializeBsonIndexTermIfNeeded(termPair);
 			if (bounds->lowerBound.indexTermValue.element.bsonValue.value_type ==
 				BSON_TYPE_MINKEY)
 			{
 				/* For exists checks we do subpath checks */
 				isPathMatch =
 					IsCompositePathWildcardMatchNoArrayCheck(
-						compareTerm->element.path,
+						termPair->term.element.path,
 						bounds->lowerBound.indexTermValue.element.path,
 						bounds->lowerBound.indexTermValue.element.pathLength);
 			}
@@ -1793,16 +1834,17 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 			{
 				/* Otherwise, we use strict path matches */
 				isPathMatch =
-					strcmp(compareTerm->element.path,
+					strcmp(termPair->term.element.path,
 						   bounds->lowerBound.indexTermValue.element.path) == 0 &&
-					compareTerm->element.pathLength ==
+					termPair->term.element.pathLength ==
 					bounds->lowerBound.indexTermValue.element.pathLength;
 			}
 
 			if (!isPathMatch)
 			{
 				/* For inequality matches, we consider subpaths of the path as valid - just not other paths */
-				return SetBoundaryStoppingValueLessThan(hasEqualityPrefix, compareTerm,
+				return SetBoundaryStoppingValueLessThan(hasEqualityPrefix,
+														termPair->serializedTerm,
 														isBackwardScan,
 														allowSkipScanBoundaries);
 			}
@@ -1812,10 +1854,22 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 	if (bounds->upperBound.bound.value_type != BSON_TYPE_EOD)
 	{
 		bool isComparisonValid = false;
-		int32_t compareBounds = CompareBsonValueAndType(
-			&compareTerm->element.bsonValue,
-			&bounds->upperBound.indexTermValue.element.bsonValue,
-			&isComparisonValid);
+		int32_t compareBounds;
+		if (EnableComparableTerms && !isWildCardMatch)
+		{
+			compareBounds = CompareSerializedBsonIndexTerms(
+				termPair->serializedTerm, bounds->upperBound.serializedTerm,
+				collation, &isComparisonValid);
+		}
+		else
+		{
+			InitializeBsonIndexTermIfNeeded(termPair);
+			compareBounds = CompareBsonValueAndTypeWithCollation(
+				&termPair->term.element.bsonValue,
+				&bounds->upperBound.indexTermValue.element.bsonValue,
+				&isComparisonValid, collation);
+		}
+
 		if (!isComparisonValid)
 		{
 			return -1;
@@ -1832,7 +1886,8 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 		else if (compareBounds > 0)
 		{
 			/* Can stop searching for ascending search */
-			return SetBoundaryStoppingValueGreaterThan(hasEqualityPrefix, compareTerm,
+			return SetBoundaryStoppingValueGreaterThan(hasEqualityPrefix,
+													   termPair->serializedTerm,
 													   isBackwardScan,
 													   allowSkipScanBoundaries);
 		}
@@ -1840,13 +1895,14 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 		if (isWildCardMatch)
 		{
 			bool isPathMatch = false;
+			InitializeBsonIndexTermIfNeeded(termPair);
 			if (bounds->upperBound.indexTermValue.element.bsonValue.value_type ==
 				BSON_TYPE_MAXKEY)
 			{
 				/* For exists checks we do subpath checks */
 				isPathMatch =
 					IsCompositePathWildcardMatchNoArrayCheck(
-						compareTerm->element.path,
+						termPair->term.element.path,
 						bounds->upperBound.indexTermValue.element.path,
 						bounds->upperBound.indexTermValue.element.pathLength);
 			}
@@ -1854,16 +1910,17 @@ RunCompareOnBounds(CompositeIndexBounds *bounds, const BsonIndexTerm *compareTer
 			{
 				/* Otherwise, we use strict path matches */
 				isPathMatch =
-					strcmp(compareTerm->element.path,
+					strcmp(termPair->term.element.path,
 						   bounds->upperBound.indexTermValue.element.path) == 0 &&
-					compareTerm->element.pathLength ==
+					termPair->term.element.pathLength ==
 					bounds->upperBound.indexTermValue.element.pathLength;
 			}
 
 			/* For inequality matches, we consider subpaths of the path as valid - just not other paths */
 			if (!isPathMatch)
 			{
-				return SetBoundaryStoppingValueGreaterThan(hasEqualityPrefix, compareTerm,
+				return SetBoundaryStoppingValueGreaterThan(hasEqualityPrefix,
+														   termPair->serializedTerm,
 														   isBackwardScan,
 														   allowSkipScanBoundaries);
 			}
@@ -2180,8 +2237,9 @@ gin_bson_composite_index_term_transform(PG_FUNCTION_ARGS)
 	}
 
 	CompositeQueryRunData *runData = (CompositeQueryRunData *) extraData;
-	BsonIndexTerm compareTerm[INDEX_MAX_KEYS] = { 0 };
-	int32_t numTerms = InitializeCompositeIndexTerm(compareKeyValue, compareTerm);
+	SerializedCompositeTermPair serializedTerms[INDEX_MAX_KEYS] = { 0 };
+	int32_t numTerms = LazyInitializeSerializedCompositeIndexTerm(compareKeyValue,
+																  serializedTerms);
 
 	if (numTerms != runData->metaInfo->numIndexPaths)
 	{
@@ -2202,13 +2260,15 @@ gin_bson_composite_index_term_transform(PG_FUNCTION_ARGS)
 	{
 		bool hasUnspecifiedPrefix = false;
 		hasEqualityPrefix = hasEqualityPrefix && priorMatchesEquality;
+
 		int32_t compareInBounds = RunCompareOnBounds(
 			&runData->indexBounds[compareIndex],
-			&compareTerm[compareIndex],
+			&serializedTerms[compareIndex],
 			hasEqualityPrefix,
 			runData->metaInfo->isBackwardScan, runData->wildcardPath != NULL,
 			allowSkipScansOnBoundary,
-			&priorMatchesEquality, &hasUnspecifiedPrefix);
+			&priorMatchesEquality, &hasUnspecifiedPrefix,
+			runData->metaInfo->collation);
 		if (compareInBounds < -1)
 		{
 			foundSkipPath = true;
@@ -2263,11 +2323,11 @@ gin_bson_composite_index_term_transform(PG_FUNCTION_ARGS)
 	 * nothing more there needs to be scanned.
 	 */
 	bytea *indexTermDatums[INDEX_MAX_KEYS] = { 0 };
-	bytea *serializedIndexterms[INDEX_MAX_KEYS] = { 0 };
-	InitializeSerializedCompositeIndexTerm(compareKeyValue, serializedIndexterms);
 	for (int i = 0; i < runData->metaInfo->numIndexPaths; i++)
 	{
-		singlePathMetadata.isDescending = IsIndexTermValueDescending(&compareTerm[i]);
+		InitializeBsonIndexTermIfNeeded(&serializedTerms[i]);
+		singlePathMetadata.isDescending = IsIndexTermValueDescending(
+			&serializedTerms[i].term);
 		bytea *serialized;
 		if (i == compareIndex)
 		{
@@ -2280,18 +2340,18 @@ gin_bson_composite_index_term_transform(PG_FUNCTION_ARGS)
 			else
 			{
 				/* Just skip all remaining values for this */
-				compareTerm[i].element.bsonValue.value_type =
+				serializedTerms[i].term.element.bsonValue.value_type =
 					singlePathMetadata.isDescending ? BSON_TYPE_MINKEY : BSON_TYPE_MAXKEY;
-				serialized = SerializeBsonIndexTerm(&compareTerm[i].element,
+				serialized = SerializeBsonIndexTerm(&serializedTerms[i].term.element,
 													&singlePathMetadata).indexTermVal;
 			}
 		}
 		else if (i > compareIndex)
 		{
 			/* Pick the smallest value for all the remaining terms */
-			compareTerm[i].element.bsonValue.value_type =
+			serializedTerms[i].term.element.bsonValue.value_type =
 				singlePathMetadata.isDescending ? BSON_TYPE_MAXKEY : BSON_TYPE_MINKEY;
-			serialized = SerializeBsonIndexTerm(&compareTerm[i].element,
+			serialized = SerializeBsonIndexTerm(&serializedTerms[i].term.element,
 												&singlePathMetadata).indexTermVal;
 		}
 		else
@@ -2300,7 +2360,8 @@ gin_bson_composite_index_term_transform(PG_FUNCTION_ARGS)
 			 * i.e we have different $undefined: true terms but the metadata gives us distinction between them.
 			 * Also, we do the PointerGetDatum and DatumGetByteaP to make sure that if it is a 1 byte header value it gets copied into a 4 byte header value.
 			 * This is ok, given that this function is called on a memory context that lives for the duration of the call. */
-			serialized = DatumGetByteaP(PointerGetDatum(serializedIndexterms[i]));
+			serialized = DatumGetByteaP(PointerGetDatum(
+											serializedTerms[i].serializedTerm));
 		}
 
 		indexTermDatums[i] = serialized;
@@ -2327,6 +2388,43 @@ gin_bson_composite_rum_config(PG_FUNCTION_ARGS)
 }
 
 
+inline static int
+GetOrderByIndexPath(pgbson *queryValue, const char **indexPaths,
+					uint32_t *indexPathLengths,
+					int numPaths, pgbsonelement *querySortElement)
+{
+	pgbsonelement sortElement;
+	if (!TryGetSinglePgbsonElementFromPgbson(queryValue, &sortElement))
+	{
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg(
+							"Invalid query value for ordering transform - only 1 path is supported")));
+	}
+
+	/* Match the order by column to the index path */
+	int orderbyIndexPath = -1;
+	for (int i = 0; i < numPaths; i++)
+	{
+		if (sortElement.pathLength == indexPathLengths[i] &&
+			strcmp(sortElement.path, indexPaths[i]) == 0)
+		{
+			orderbyIndexPath = i;
+			break;
+		}
+	}
+
+	if (orderbyIndexPath < 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("Order by path '%s' does not match any index path",
+							   sortElement.path)));
+	}
+
+	*querySortElement = sortElement;
+	return orderbyIndexPath;
+}
+
+
 Datum
 gin_bson_composite_ordering_transform(PG_FUNCTION_ARGS)
 {
@@ -2350,8 +2448,9 @@ gin_bson_composite_ordering_transform(PG_FUNCTION_ARGS)
 		indexPathLengths,
 		sortOrders);
 
-	BsonIndexTerm compareTerm[INDEX_MAX_KEYS] = { 0 };
-	int32_t numPathsInIndex = InitializeCompositeIndexTerm(compareValue, compareTerm);
+	SerializedCompositeTermPair compareTerms[INDEX_MAX_KEYS] = { 0 };
+	int32_t numPathsInIndex = LazyInitializeSerializedCompositeIndexTerm(compareValue,
+																		 compareTerms);
 	if (numPathsInIndex != numPaths)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
@@ -2360,119 +2459,158 @@ gin_bson_composite_ordering_transform(PG_FUNCTION_ARGS)
 							   numPathsInIndex, numPaths)));
 	}
 
-	pgbson *result = NULL;
+	Datum result = (Datum) 0;
 
-	/* Index only scan, we need to reconstruct and project the document back. */
-	if (strategy == UINT16_MAX)
+	switch (strategy)
 	{
-		pgbson_heap_writer *writer;
-
-		/* Start over if the priorKey is not provided (handles the rescan scenario)
-		 * Note that we don't check or free the writer since the MemoryContext
-		 * is reset in between rescan scenarios.
-		 */
-		if (fcinfo->flinfo->fn_extra == NULL || currentKey == (Datum) 0)
+		/* Index only scan, we need to reconstruct and project the document back. */
+		case UINT16_MAX:
 		{
-			writer = PgbsonHeapWriterInit();
-			fcinfo->flinfo->fn_extra = (void *) writer;
-		}
-		else
-		{
-			writer = (pgbson_heap_writer *) fcinfo->flinfo->fn_extra;
-			PgbsonHeapWriterReset(writer);
-		}
+			pgbson_heap_writer *writer;
 
-		for (int i = 0; i < numPaths; i++)
-		{
-			BsonIndexTerm *term = &compareTerm[i];
-			PgbsonHeapWriterAppendValue(writer, indexPaths[i], indexPathLengths[i],
-										&term->element.bsonValue);
-		}
-
-		bson_value_t value = PgbsonHeapWriterGetValue(writer);
-
-		if (currentKey == (Datum) 0)
-		{
-			result = PgbsonInitFromDocumentBsonValue(&value);
-		}
-		else
-		{
-			pgbson *existing = DatumGetPgBson(currentKey);
-			Size currentSize = VARSIZE(existing);
-
-			Size requiredSize = value.value.v_doc.data_len + VARHDRSZ;
-			if (currentSize < requiredSize)
+			/* Start over if the priorKey is not provided (handles the rescan scenario)
+			 * Note that we don't check or free the writer since the MemoryContext
+			 * is reset in between rescan scenarios.
+			 */
+			if (fcinfo->flinfo->fn_extra == NULL || currentKey == (Datum) 0)
 			{
-				existing = repalloc(existing, requiredSize);
+				writer = PgbsonHeapWriterInit();
+				fcinfo->flinfo->fn_extra = (void *) writer;
+			}
+			else
+			{
+				writer = (pgbson_heap_writer *) fcinfo->flinfo->fn_extra;
+				PgbsonHeapWriterReset(writer);
 			}
 
-			uint8_t *dataValues = (uint8_t *) VARDATA(existing);
-			memcpy(dataValues, value.value.v_doc.data, value.value.v_doc.data_len);
-			SET_VARSIZE(existing, requiredSize);
-			result = existing;
-		}
-	}
-	else
-	{
-		if (currentKey != (Datum) 0)
-		{
-			pgbson *currentOrdering = DatumGetPgBsonPacked(currentKey);
-			pfree(currentOrdering);
+			for (int i = 0; i < numPaths; i++)
+			{
+				InitializeBsonIndexTermIfNeeded(&compareTerms[i]);
+				BsonIndexTerm *term = &compareTerms[i].term;
+				PgbsonHeapWriterAppendValue(writer, indexPaths[i], indexPathLengths[i],
+											&term->element.bsonValue);
+			}
+
+			bson_value_t value = PgbsonHeapWriterGetValue(writer);
+
+			if (currentKey == (Datum) 0)
+			{
+				result = PointerGetDatum(PgbsonInitFromDocumentBsonValue(&value));
+			}
+			else
+			{
+				pgbson *existing = DatumGetPgBson(currentKey);
+				Size currentSize = VARSIZE(existing);
+
+				Size requiredSize = value.value.v_doc.data_len + VARHDRSZ;
+				if (currentSize < requiredSize)
+				{
+					existing = repalloc(existing, requiredSize);
+				}
+
+				uint8_t *dataValues = (uint8_t *) VARDATA(existing);
+				memcpy(dataValues, value.value.v_doc.data, value.value.v_doc.data_len);
+				SET_VARSIZE(existing, requiredSize);
+				result = PointerGetDatum(existing);
+			}
+
+			break;
 		}
 
-		pgbson *queryValue = PG_GETARG_PGBSON_PACKED(1);
-		pgbsonelement sortElement;
-		if (!TryGetSinglePgbsonElementFromPgbson(queryValue, &sortElement))
+		/* Order by on BSON */
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE:
 		{
-			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+			if (currentKey != (Datum) 0)
+			{
+				pgbson *currentOrdering = DatumGetPgBsonPacked(currentKey);
+				pfree(currentOrdering);
+			}
+
+			pgbsonelement sortElement;
+			int orderbyIndexPath = GetOrderByIndexPath(PG_GETARG_PGBSON_PACKED(1),
+													   indexPaths,
+													   indexPathLengths, numPaths,
+													   &sortElement);
+
+			/* Match the runtime format of order by */
+			InitializeBsonIndexTermIfNeeded(&compareTerms[orderbyIndexPath]);
+			pgbson_writer writer;
+			PgbsonWriterInit(&writer);
+			PgbsonWriterAppendValue(&writer, sortElement.path, sortElement.pathLength,
+									&compareTerms[orderbyIndexPath].term.element.bsonValue);
+
+			/* Check if it's a reverse scan */
+			if (strategy == BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE)
+			{
+				/* Reverse sort add truncation status */
+				if (IsIndexTermTruncated(&compareTerms[orderbyIndexPath].term))
+				{
+					PgbsonWriterAppendBool(&writer, "t", 1,
+										   IsIndexTermTruncated(
+											   &compareTerms[orderbyIndexPath].term));
+				}
+
+				PgbsonWriterAppendBool(&writer, "r", 1, true);
+			}
+
+			result = PointerGetDatum(PgbsonWriterGetPgbson(&writer));
+			break;
+		}
+
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_INDEXTERM:
+		{
+			if (currentKey != (Datum) 0)
+			{
+				bytea *currentOrdering = DatumGetByteaPP(currentKey);
+				pfree(currentOrdering);
+			}
+
+			pgbsonelement sortElement;
+			int orderbyIndexPath = GetOrderByIndexPath(PG_GETARG_PGBSON_PACKED(1),
+													   indexPaths,
+													   indexPathLengths, numPaths,
+													   &sortElement);
+
+			bytea *indexTerm = compareTerms[orderbyIndexPath].serializedTerm;
+			bool requiresReversing = false;
+
+			int querySort = BsonValueAsInt32(&sortElement.bsonValue);
+			if (IsSerializedIndexTermTruncated(indexTerm))
+			{
+				/* Truncated terms always show up in ascending order */
+				requiresReversing = IsSerializedTermValueDescending(indexTerm);
+			}
+			else if (sortOrders[orderbyIndexPath] != querySort)
+			{
+				/* If the sort order matches, we can just return the index term as is */
+				requiresReversing = true;
+			}
+
+			/* For index term ordering, we just return the index term for the order by path */
+			if (requiresReversing)
+			{
+				result = PointerGetDatum(FormReversedIndexTerm(indexTerm));
+			}
+			else
+			{
+				result = PointerGetDatum(DatumGetByteaPCopy(PointerGetDatum(indexTerm)));
+			}
+
+			break;
+		}
+
+		default:
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg(
-								"Invalid query value for ordering transform - only 1 path is supported")));
+								"Unsupported strategy for composite index ordering transform: %d",
+								strategy)));
 		}
-
-		/* Match the order by column to the index path */
-		int orderbyIndexPath = -1;
-		for (int i = 0; i < numPaths; i++)
-		{
-			if (sortElement.pathLength == indexPathLengths[i] &&
-				strcmp(sortElement.path, indexPaths[i]) == 0)
-			{
-				orderbyIndexPath = i;
-				break;
-			}
-		}
-
-		if (orderbyIndexPath < 0)
-		{
-			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
-							errmsg("Order by path '%s' does not match any index path",
-								   sortElement.path)));
-		}
-
-		/* Match the runtime format of order by */
-		pgbson_writer writer;
-		PgbsonWriterInit(&writer);
-		PgbsonWriterAppendValue(&writer, sortElement.path, sortElement.pathLength,
-								&compareTerm[orderbyIndexPath].element.bsonValue);
-
-		/* Check if it's a reverse scan */
-		if (strategy == BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE)
-		{
-			/* Reverse sort add truncation status */
-			if (IsIndexTermTruncated(&compareTerm[orderbyIndexPath]))
-			{
-				PgbsonWriterAppendBool(&writer, "t", 1,
-									   IsIndexTermTruncated(
-										   &compareTerm[orderbyIndexPath]));
-			}
-
-			PgbsonWriterAppendBool(&writer, "r", 1, true);
-		}
-
-		result = PgbsonWriterGetPgbson(&writer);
 	}
 
 	PG_FREE_IF_COPY(compareValue, 0);
-	PG_RETURN_POINTER(result);
+	PG_RETURN_DATUM(result);
 }
 
 
@@ -2536,6 +2674,11 @@ gin_bson_composite_path_options(PG_FUNCTION_ARGS)
 							IndexOptionsVersion_V0,          /* min */
 							IndexOptionsVersion_V1,          /* max */
 							offsetof(BsonGinCompositePathOptions, base.version));
+
+	add_local_string_reloption(relopts, "cl",
+							   "Collation of the index",
+							   NULL, &ValidateCollationSpec, &FillCollationSpec,
+							   offsetof(BsonGinCompositePathOptions, base.collation));
 
 	PG_RETURN_VOID();
 }
@@ -2783,7 +2926,8 @@ GetCompositeTraverseOptionWildCard(BsonGinCompositePathOptions *options, BsonInd
 	}
 
 	if (strategy == BSON_INDEX_STRATEGY_DOLLAR_ORDERBY ||
-		strategy == BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE)
+		strategy == BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE ||
+		strategy == BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_INDEXTERM)
 	{
 		/* For now we don't push down orderby. This can be relaxed
 		 * later if we're matching on a single filter path range
@@ -3018,6 +3162,25 @@ GetEqualityRangePredicatesForIndexPath(IndexPath *indexPath, void *options,
 }
 
 
+void
+SerializeCompositeIndexKeyForExplainToWriter(bytea *entry, pgbson_writer *writer)
+{
+	BsonGinCompositePathOptions *pathOptions = (BsonGinCompositePathOptions *) entry;
+	const char *indexPaths[INDEX_MAX_KEYS] = { 0 };
+	uint32_t indexPathsLengths[INDEX_MAX_KEYS] = { 0 };
+	int8_t sortOrders[INDEX_MAX_KEYS] = { 0 };
+
+	int numPaths = GetIndexPathsFromOptionsWithLength(
+		pathOptions,
+		indexPaths, indexPathsLengths, sortOrders);
+	for (int i = 0; i < numPaths; i++)
+	{
+		PgbsonWriterAppendInt32(writer, indexPaths[i], indexPathsLengths[i],
+								sortOrders[i]);
+	}
+}
+
+
 char *
 SerializeCompositeIndexKeyForExplain(bytea *entry)
 {
@@ -3239,18 +3402,28 @@ DetermineCompositeScanDirection(bytea *compositeScanOptions,
 		indexPaths, sortOrders);
 
 	/* For the first key, match it to the appropriate path*/
-	pgbson *sortSpec = DatumGetPgBson(orderbys[0].sk_argument);
-	pgbsonelement sortElement;
-	PgbsonToSinglePgbsonElement(sortSpec, &sortElement);
-
-	int sortAsc = BsonValueAsInt32(&sortElement.bsonValue);
-	for (int i = 0; i < numPaths; i++)
+	switch (orderbys[0].sk_strategy)
 	{
-		if (strcmp(sortElement.path, indexPaths[i]) == 0)
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_REVERSE:
+		case BSON_INDEX_STRATEGY_DOLLAR_ORDERBY_INDEXTERM:
 		{
-			/* Found a path match - return scanDirection based on direction */
-			return sortAsc == sortOrders[i] ? ForwardScanDirection :
-				   BackwardScanDirection;
+			pgbson *sortSpec = DatumGetPgBson(orderbys[0].sk_argument);
+			pgbsonelement sortElement;
+			PgbsonToSinglePgbsonElement(sortSpec, &sortElement);
+
+			int sortAsc = BsonValueAsInt32(&sortElement.bsonValue);
+			for (int i = 0; i < numPaths; i++)
+			{
+				if (strcmp(sortElement.path, indexPaths[i]) == 0)
+				{
+					/* Found a path match - return scanDirection based on direction */
+					return sortAsc == sortOrders[i] ? ForwardScanDirection :
+						   BackwardScanDirection;
+				}
+			}
+
+			break;
 		}
 	}
 
@@ -3376,11 +3549,19 @@ ModifyScanKeysForCompositeScan(ScanKey scankey, int nscankeys, ScanKey targetSca
 		BsonIndexStrategy strategy = scankey[i].sk_strategy;
 		pgbson *secondBson = DatumGetPgBson(scanKeyArg);
 
+		/* Extract the query element, stripping the collation field if present.
+		 * The collation is carried in the BSON as a second field but should not
+		 * be included in the composite query spec — it's handled at index
+		 * selection time. */
+		pgbsonelement queryElement;
+		PgbsonToSinglePgbsonElementWithCollation(secondBson, &queryElement);
+
 		pgbson_writer clauseWriter;
 		PgbsonArrayWriterStartDocument(&queryWriter, &clauseWriter);
 		PgbsonWriterAppendInt32(&clauseWriter, "op", 2,
 								strategy);
-		PgbsonWriterConcat(&clauseWriter, secondBson);
+		PgbsonWriterAppendValue(&clauseWriter, queryElement.path,
+								queryElement.pathLength, &queryElement.bsonValue);
 		PgbsonArrayWriterEndDocument(&queryWriter, &clauseWriter);
 	}
 
@@ -3743,9 +3924,21 @@ CreateSinglePathOptions(const char *indexPath, int32_t pathIndex, int32_t pathCo
 						BsonGinCompositePathOptions *compositeOptions,
 						bool *allowValueOnly)
 {
+	/* Determine the collation from composite options */
+	StringView compositeCollation = { 0 };
+	Get_Index_Collation_Option((&compositeOptions->base), collation,
+							   compositeCollation.string,
+							   compositeCollation.length);
+
+	Size collationSize = 0;
+	if (IsCollationValid(compositeCollation.string))
+	{
+		collationSize = FillCollationSpec(compositeCollation.string, NULL);
+	}
+
 	Size requiredSize = FillSinglePathSpec(indexPath, NULL);
-	BsonGinSinglePathOptions *singlePathOptions = palloc(
-		sizeof(BsonGinSinglePathOptions) + requiredSize + 1);
+	BsonGinSinglePathOptions *singlePathOptions = palloc0(
+		sizeof(BsonGinSinglePathOptions) + requiredSize + collationSize);
 	singlePathOptions->base.type = IndexOptionsType_SinglePath;
 	singlePathOptions->base.version = IndexOptionsVersion_V0;
 
@@ -3762,11 +3955,19 @@ CreateSinglePathOptions(const char *indexPath, int32_t pathIndex, int32_t pathCo
 		compositeOptions->base.wildcardIndexTruncatedPathLimit;
 	singlePathOptions->path = sizeof(BsonGinSinglePathOptions);
 
-	/* TODO: pass down collation from composite options */
-	singlePathOptions->collation = 0;
 
 	FillSinglePathSpec(indexPath, ((char *) singlePathOptions) +
 					   sizeof(BsonGinSinglePathOptions));
+
+	/* Pass down collation from composite options */
+	if (IsCollationValid(compositeCollation.string))
+	{
+		singlePathOptions->base.collation = sizeof(BsonGinSinglePathOptions) +
+											requiredSize;
+		FillCollationSpec(compositeCollation.string,
+						  ((char *) singlePathOptions) +
+						  singlePathOptions->base.collation);
+	}
 
 	*allowValueOnly = subMetadata.allowValueOnly;
 	return singlePathOptions;

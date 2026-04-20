@@ -12,6 +12,7 @@
 #define BSON_GIN_INDEX_MGMT_H
 
 #include "opclass/bson_gin_common.h"
+#include "access/reloptions.h"
 
 /*
  * Enum identifying the kind of index based on the options.
@@ -72,6 +73,7 @@ typedef struct
 	int intOption_deprecated;   /* This is a deprecated field for int type fields */
 	int32_t indexTermTruncateLimit; /* this must be the next field in all index options */
 	uint32_t wildcardIndexTruncatedPathLimit;
+	int collation;
 } BsonGinIndexOptionsBase;
 
 /*
@@ -87,7 +89,6 @@ typedef struct
 	bool generateNotFoundTerm;
 	bool useReducedWildcardTerms;
 	int path;
-	int collation;
 } BsonGinSinglePathOptions;
 
 /*
@@ -105,7 +106,6 @@ typedef struct
 	bool isExclusion;
 	bool includeId;
 	int pathSpec;
-	int collation;
 } BsonGinWildcardProjectionPathOptions;
 
 /*
@@ -201,6 +201,7 @@ typedef struct
 
 bool ValidateIndexForQualifierElement(bytea *indexOptions,
 									  pgbsonelement *queryelement,
+									  const char *queryCollation,
 									  BsonIndexStrategy strategy);
 bool ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue,
 									BsonIndexStrategy
@@ -219,6 +220,7 @@ struct PathKey;
 struct Expr;
 typedef struct SortIndexInputDetails
 {
+	Oid funcOid;
 	const char *sortPath;
 	struct Expr *sortVar;
 	struct Expr *sortDatum;
@@ -238,8 +240,6 @@ const char * GetFirstPathFromIndexOptionsIfApplicable(bytea *indexOptions,
 													  bool *isWildcardIndex);
 bool PathHasArrayIndexElements(const StringView *path);
 bool SubPathHasArrayIndexElements(const StringView *path, StringView subPath);
-
-void GetCollationFromIndexOptions(void *indexOptions, StringView *collationString);
 
 struct PlannerInfo;
 bool TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct
